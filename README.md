@@ -1,4 +1,4 @@
-# tradeai-cortical
+# Cortical Trading
 
 A DishBrain-style closed-loop "trading game" that embodies Cortical Labs (CL1)
 biological neurons in the /MBT micro Bitcoin futures market. Market state is
