@@ -6,10 +6,15 @@ Sources (recordings or synthetic regimes) are resampled onto a fixed step grid
 - "encoded": exactly the market signal the neurons receive today -- the
   tanh-normalized momentum from FeatureTracker, computed with the same code
   and config. One column.
-- "extended": candidate Phase-2 sensory channels -- returns over several
-  windows (fixed-scale and vol-normalized), short/long volatility ratio,
+- "extended": candidate Phase-2 sensory channels -- returns over windows from
+  1 s to 4 h (fixed-scale and vol-normalized), short/long volatility ratio,
   spread in ticks, book imbalance, level proximity (position within the
   rolling 5-min/30-min range and range width in vol units), time of day.
+  Windows longer than WARMUP_S report 0 until enough history accumulates
+  within the segment -- the live encoder's "zero = no information" semantics
+  -- so short recordings still build a dataset; the long-window columns just
+  carry nothing there. Evaluating the hour-scale windows requires multi-day
+  contiguous recordings.
 
 Labels are the sign of the forward mid move over each horizon. All features
 use only past data; standardization happens later on train statistics only.
@@ -119,11 +124,18 @@ def synthetic_series(cfg: SyntheticCfg, steps: int, step_s: float = 1.0) -> list
 
 # ---------------------------------------------------------------------------
 
-RETURN_WINDOWS_S = (1.0, 5.0, 15.0, 30.0, 60.0, 90.0, 120.0)
-ZRET_WINDOWS_S = (5.0, 30.0, 120.0)     # vol-normalized momentum (sigma units)
+# Day-trader momentum ladder: seconds for the game's current cadence, then
+# 5m/15m/30m/1h/4h where large directional moves actually develop.
+RETURN_WINDOWS_S = (1.0, 5.0, 15.0, 30.0, 60.0, 90.0, 120.0,
+                    300.0, 900.0, 1800.0, 3600.0, 14400.0)
+ZRET_WINDOWS_S = (5.0, 30.0, 120.0, 900.0, 3600.0, 14400.0)  # vol-normalized momentum (sigma units)
 LEVEL_WINDOWS_S = (300.0, 1800.0)       # near-term level structure windows
 VOL_SHORT_S = 30.0
 VOL_LONG_S = 300.0
+# Rows discarded at each segment start so every window at or below this is
+# fully defined. Longer windows zero-fill until their history exists instead
+# of pushing the warmup to 4 h (which would discard short recordings wholesale).
+WARMUP_S = 120.0
 
 EXTENDED_NAMES = (
     [f"ret_{int(w)}s" for w in RETURN_WINDOWS_S]
@@ -166,7 +178,7 @@ def build_dataset(
 ) -> BaselineDataset:
     enc_cfg = cfg.neural.encoding
     tick = cfg.instrument.tick_size
-    warmup = int(max(max(RETURN_WINDOWS_S), enc_cfg.momentum_window_s) / step_s) + 1
+    warmup = int(max(WARMUP_S, enc_cfg.momentum_window_s) / step_s) + 1
     max_h = int(max(horizons_s) / step_s)
 
     xs_enc, xs_ext, meta_rows, seg_ids = [], [], [], []
@@ -192,7 +204,11 @@ def build_dataset(
         vol_l = _rolling_std(diffs, int(VOL_LONG_S / step_s))
         cols: dict[str, np.ndarray] = {}
 
-        # Multi-timescale momentum, fixed scale (matches the live encoder's units).
+        # Multi-timescale momentum, fixed scale (matches the live encoder's
+        # units). Points-per-second shrinks with the window (~1/sqrt(w) for a
+        # diffusive price), so the hour-scale columns sit deep in tanh's linear
+        # region -- harmless here because both probes standardize on train
+        # stats, but a wetware encoding of these would need per-window scales.
         for w_s in RETURN_WINDOWS_S:
             w = int(w_s / step_s)
             ret = np.zeros(n)

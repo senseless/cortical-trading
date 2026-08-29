@@ -4,9 +4,11 @@ the neurons see, at the game's cadence, after real costs?
 Usage:
     python train_baseline.py                                  # synthetic sine (should PASS: sanity check)
     python train_baseline.py --data synthetic:random_walk     # unlearnable control (should FAIL: no leakage)
-    python train_baseline.py --data data/market/MBTU26_XCME_20260828_203316.jsonl.gz
+    python train_baseline.py --data data/market/<recording>.jsonl.gz
     python train_baseline.py --data <file1> --data <file2>    # multiple recordings
     python train_baseline.py --horizons 5,15,30,60 --band 0.1
+    python train_baseline.py --horizons 60,300,900,3600 ...   # day-trader horizons; needs
+                                                              # correspondingly long recordings
 
 Interpretation: if no model beats the majority-class share (outside the
 binomial CI) on real data at any horizon, the current encoding carries no

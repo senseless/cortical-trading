@@ -55,7 +55,7 @@ Requires Python 3.11+. Synthetic and replay sessions need no credentials.
 .venv\Scripts\python record_market.py --product "MBT,MET,MNQ,MES,M2K,MYM,MCL,MGC,SIL,MHG,M6E" --forever
 
 # Replay a recorded session
-.venv\Scripts\python run_session.py --set market.source=replay --set "market.replay.path=data/market/MBTU26_XCME_20260828_203316.jsonl.gz"
+.venv\Scripts\python run_session.py --set market.source=replay --set "market.replay.path=data/market/<recording>.jsonl.gz"
 
 # Silicon baseline gate: can a conventional learner (GPU MLP + logistic) find
 # edge in what the neurons see? Sanity-check on sine, control on random walk,
@@ -63,6 +63,7 @@ Requires Python 3.11+. Synthetic and replay sessions need no credentials.
 .venv\Scripts\python train_baseline.py                                # synthetic sine (must pass)
 .venv\Scripts\python train_baseline.py --data synthetic:random_walk   # control (must show no signal)
 .venv\Scripts\python train_baseline.py --data data/market/<recording>.jsonl.gz
+.venv\Scripts\python train_baseline.py --data <recording> --horizons 60,300,900,3600   # day-trader horizons (needs multi-day recordings)
 
 # Analyze a finished session (learning curves, action-reward alignment)
 .venv\Scripts\python analyze_recording.py data/sessions/<session_dir>
@@ -94,6 +95,69 @@ Requires Python 3.11+. Synthetic and replay sessions need no credentials.
    log per session plus the CL HDF5 recording with spikes, stims, and game
    state as a data stream.
 
+## Electrode layout
+
+The 64 electrodes form an 8x8 grid (channel = row * 8 + column). CL1 hardware
+reserves five of them: 0, 7, 56, 63 (unused grid corners) and 4 (measurement
+reference). The simulator accepts stims on those channels but hardware
+silently drops them, so the config validator rejects any layout that assigns
+them. The default layout (`[neural.layout]` in `config/default.toml`):
+
+```
+        c0    c1    c2    c3    c4    c5    c6    c7
+  r0    xx    M+    M+    M+    xx    M+     .     xx
+  r1    M-    M-    M-    M-     .     .     .     .
+  r2    PL    PL     .     .    U+    U+     .     .
+  r3    PF    PF     .     .    U-    U-     .     .
+  r4    PS    PS     .     .     .     .     .     .
+  r5   BUY   BUY   BUY   BUY   SEL   SEL   SEL   SEL
+  r6   BUY   BUY   BUY   BUY   SEL   SEL   SEL   SEL
+  r7    xx     .     .     .     .     .     .    xx
+```
+
+`xx` reserved &nbsp;|&nbsp; `.` unassigned (still recorded) &nbsp;|&nbsp;
+sensory: `M+/M-` momentum up/down, `PL/PF/PS` position long/flat/short,
+`U+/U-` unrealized PnL up/down &nbsp;|&nbsp; motor: `BUY`/`SEL` decode regions
+
+Why this shape:
+
+- **Place + rate coding.** Each signal gets a dedicated electrode group
+  (*where* = meaning); stimulation frequency (4-40 Hz) carries magnitude.
+  Exactly-zero signals are silence, not a weak positive.
+- **Opposite valences on separate rows.** Stimulation activates tissue beyond
+  the target electrode (~100 um), so groups whose meanings are opposites
+  (`M+`/`M-`, `U+`/`U-`) get physical separation — blending them would
+  destroy the signal they carry.
+- **Sensory top, motor bottom.** Maximizing distance between stimulation
+  sites and decode regions keeps directly evoked activity from dominating
+  the spike counts the decoder reads; the decision should ride on network
+  dynamics, not on stim artifacts.
+- **Contiguous motor blocks.** Buy and sell are 2x4 regions side by side
+  (mirroring DishBrain's two paddle regions); decoding compares region-level
+  spike counts, which is robust to single-electrode noise.
+
+### Planned: chronotopic input strips (Phase 2, gated on the silicon baseline)
+
+If the baseline gate finds after-cost signal at several momentum horizons,
+the two momentum groups become two topographic *strips*: timescale ordered
+short -> long along each strip — "chronotopy", by analogy with the tonotopic
+frequency axis of auditory cortex — one strip for up-momentum, one for down,
+separated by a guard row.
+
+The rationale: adjacent electrodes recruit overlapping neural populations,
+and neurons in culture are more likely to be synaptically connected the
+closer they are. Momentum at neighboring timescales is strongly correlated,
+so placing those signals on neighboring sites turns electrode cross-talk
+into generalization rather than interference. Blending is *desired* along
+the timescale axis and *destructive* across valence — hence parallel strips
+with a guard row between them. This also gives classic multi-timeframe
+structure a spatial signature: a short-term pullback inside a long-term
+uptrend lights the down strip at its short end and the up strip at its long
+end simultaneously — a pattern a single-window encoding cannot represent.
+The layout is pure configuration (`[neural.layout.sensory]`); the encoder
+additionally needs a per-window rate scale, since raw points-per-second
+momentum shrinks roughly with the square root of the window length.
+
 ## Contract rolls
 
 Live sessions and recordings always start on the tradeable front month: the
@@ -119,11 +183,15 @@ before graduating.
 The silicon baseline (`train_baseline.py`) is the gate in front of all of it:
 if no conventional learner can extract edge from the encoded features at game
 cadence after real costs, the game design needs work before spending wetware
-rental time. It reports directional accuracy per horizon (with
-overlap-adjusted confidence intervals) for both the current neural encoding
-and an extended candidate-channel set, and backtests the resulting policies
-through the real game engine and paper broker against time-shifted luck
-baselines.
+rental time. It reports directional accuracy per horizon against the
+majority-class benchmark (with overlap-adjusted confidence intervals) for
+both the current neural encoding and an extended candidate-channel set —
+returns over a day-trader ladder of windows from 1 s to 4 h, vol-normalized
+variants, volatility regime, spread, book imbalance, range position, time of
+day — and backtests the resulting policies through the real game engine and
+paper broker against time-shifted luck baselines. The hour-scale windows and
+label horizons only mean anything on multi-day contiguous recordings, which
+is what the `--forever` library builder accumulates.
 
 ## Project layout
 
