@@ -1,9 +1,14 @@
 """Append-only JSONL(.gz) recorder building the replay library.
 
+File creation is lazy: the file (with its meta header) is only created when
+the first event is written, so a connected-but-idle market (weekend close,
+CME maintenance) never litters the library with empty files -- reconnect
+cycles cost no disk writes at all.
+
 One file never spans two contracts: on a roll the live source calls rotate(),
-which closes the current file and starts a new one for the new symbol. All
-methods are thread-safe (writes come from the stream thread, flushes may come
-from the caller's thread).
+which closes the current file and points at a new path for the new symbol.
+All methods are thread-safe (writes come from the stream thread, flushes may
+come from the caller's thread).
 """
 
 from __future__ import annotations
@@ -26,19 +31,28 @@ class MarketRecorder:
     def __init__(self, path: str | Path, symbol: str, meta: dict | None = None):
         self.path = Path(path)
         self._lock = threading.Lock()
-        self._fh = _open(self.path)
-        self.quotes = 0  # cumulative across rotations
+        self._fh = None            # created on first event write
+        self._symbol = symbol
+        self._meta = dict(meta) if meta else {}
+        self._closed = False
+        self.quotes = 0  # cumulative across rotations (written events only)
         self.trades = 0
-        self._write_meta(symbol, meta)
 
-    def _write_meta(self, symbol: str, meta: dict | None) -> None:
-        header = {"type": "meta", "symbol": symbol, "recorded_at": time.time()}
-        if meta:
-            header.update(meta)
-        self._write(header)
+    @property
+    def created(self) -> bool:
+        """True once the current file exists (at least one event was written)."""
+        with self._lock:
+            return self._fh is not None
 
     def _write(self, obj: dict) -> None:
         with self._lock:
+            if self._closed:
+                return  # straggler write after close(); do not resurrect the file
+            if self._fh is None:
+                self._fh = _open(self.path)
+                header = {"type": "meta", "symbol": self._symbol,
+                          "recorded_at": time.time(), **self._meta}
+                self._fh.write(json.dumps(header, separators=(",", ":")) + "\n")
             self._fh.write(json.dumps(obj, separators=(",", ":")) + "\n")
 
     def quote(self, t: float, bid: float, ask: float, bid_size: float = 0.0, ask_size: float = 0.0) -> None:
@@ -50,20 +64,26 @@ class MarketRecorder:
         self.trades += 1
 
     def rotate(self, symbol: str, path: str | Path, meta: dict | None = None) -> None:
-        """Close the current file and continue into a new one (contract roll)."""
+        """Close the current file (if any) and continue into a new one (contract roll)."""
         with self._lock:
-            self._fh.close()
+            if self._fh is not None:
+                self._fh.close()
+                self._fh = None
             self.path = Path(path)
-            self._fh = _open(self.path)
-        self._write_meta(symbol, meta)
+            self._symbol = symbol
+            self._meta = dict(meta) if meta else {}
 
     def flush(self) -> None:
         with self._lock:
-            self._fh.flush()
+            if self._fh is not None:
+                self._fh.flush()
 
     def close(self) -> None:
         with self._lock:
-            self._fh.close()
+            self._closed = True
+            if self._fh is not None:
+                self._fh.close()
+                self._fh = None
 
 
 def default_recording_path(symbol: str, base_dir: str | Path = "data/market") -> Path:

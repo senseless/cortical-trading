@@ -26,7 +26,8 @@ class Trade:
     exit_t: float = 0.0
     exit_price: float = 0.0
     costs: float = 0.0      # $ commissions+fees, both sides
-    points: float = 0.0     # signed points captured
+    points: float = 0.0     # signed points captured (gross)
+    net_points: float = 0.0  # points after costs (costs converted at point_value)
     dollars: float = 0.0    # $ PnL after costs
 
     def close(self, fill: Fill, point_value: float) -> None:
@@ -35,6 +36,9 @@ class Trade:
         self.costs += fill.commission
         self.points = self.direction * (self.exit_price - self.entry_price)
         self.dollars = self.points * point_value - self.costs
+        # point_value > 0 is enforced at config load; a silent gross fallback
+        # here would quietly disable cost-awareness in the reward signal.
+        self.net_points = self.dollars / point_value
 
 
 @dataclass

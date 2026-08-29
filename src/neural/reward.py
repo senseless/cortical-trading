@@ -1,17 +1,24 @@
 """Reward generator: the free-energy-principle learning signal.
 
-Favorable outcomes earn predictable stimulation (structured 100 Hz bursts
-across encoding and decoding regions, per DishBrain/gridworld); adverse
-outcomes earn unpredictable stimulation (random sites, random timing). Reward
-timing is the main experimental variable: per-tick mark-to-market shaping,
-per-trade outcomes, or hybrid (small shaping + full feedback on trade close).
+Favorable outcomes earn predictable stimulation (structured 100 Hz bursts, per
+DishBrain/gridworld); adverse outcomes earn unpredictable stimulation (random
+sites, random timing). Full (per-trade) feedback spans encoding and decoding
+regions and pauses play for its delivery window; mini (per-tick shaping)
+feedback is delivered to sensory channels only, because it has no pause and
+its evoked spikes land in the next decision window. Reward timing is the main
+experimental variable: per-tick mark-to-market shaping, per-trade outcomes, or
+hybrid (small shaping + full feedback on trade close).
 
-The shuffle flag decouples feedback from outcomes (coin flip) -- the control
-condition that distinguishes real learning from stimulation artifacts.
+The shuffle flag decouples feedback from outcomes -- the control condition
+that distinguishes real learning from stimulation artifacts. Valence is drawn
+from a resampled history of *true* outcomes rather than a coin flip, so the
+control arm receives the same marginal reward/punishment rates (and pause
+budget) as the experimental arm; only the contingency is broken.
 """
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -36,16 +43,35 @@ class RewardGenerator:
         self.cfg = cfg
         self.layout = layout
         self._rng = np.random.default_rng(seed)
+        # Full feedback spans encoding AND decoding regions (play is paused for
+        # its window, so its evoked spikes never reach a decision). Mini
+        # (per-tick shaping) feedback has no pause -- its evoked activity lands
+        # in the very next decision window -- so it must not stimulate motor
+        # channels directly, or the decoder reads the feedback itself as market
+        # opinion. Sensory-only mini feedback also matches DishBrain, which
+        # applies outcome stimulation to the sensory area.
         self._feedback_channels = sorted(set(layout.all_sensory) | set(layout.all_motor))
+        self._mini_channels = list(layout.all_sensory)
+        # True-outcome histories for the shuffle control, kept separately for
+        # full and mini feedback (their favorable rates differ).
+        self._outcomes: dict[bool, deque[bool]] = {True: deque(maxlen=50), False: deque(maxlen=50)}
 
     # -- outcome evaluation ----------------------------------------------------
 
     def evaluate(self, step: StepResult) -> FeedbackEvent | None:
         """Map a game step outcome to a feedback event (or None)."""
         timing = self.cfg.timing
-        # Full feedback on closed trades (per_trade and hybrid).
+        # Full feedback on closed trades (per_trade and hybrid). Net of costs:
+        # on /MBT the ~$4 round trip is worth 40 points, so rewarding gross
+        # points would praise trades that lose money after commissions and
+        # train the culture to churn.
         if timing in ("per_trade", "hybrid") and step.closed_trade is not None:
-            reward = step.closed_trade.points
+            reward = step.closed_trade.net_points
+            # Deadband on the outcome too: a scratch trade within +/-deadband
+            # of net breakeven is noise -- full 3 s punishment for -0.5 net
+            # points would weigh it the same as a disaster.
+            if abs(reward) <= self.cfg.deadband_points:
+                return None
             return self._build(reward, full=True)
         # Mark-to-market shaping (per_tick and hybrid).
         if timing in ("per_tick", "hybrid"):
@@ -56,10 +82,20 @@ class RewardGenerator:
     def _build(self, reward: float, full: bool) -> FeedbackEvent:
         favorable = reward > 0
         if self.cfg.shuffle:
-            favorable = bool(self._rng.integers(0, 2))
+            # Resample a past true outcome instead of flipping a coin: a coin
+            # flip would give the control arm 50/50 feedback while the real
+            # arm skews toward punishment early on, confounding the comparison
+            # with stim-dose and pause-budget differences.
+            history = self._outcomes[full]
+            history.append(favorable)
+            favorable = bool(history[int(self._rng.integers(0, len(history)))])
         if favorable:
+            # Full reward suspends play for the delivery window, mirroring the
+            # punishment pause: the burst drives every motor channel, so the
+            # next decision must not decode a window full of evoked spikes.
+            pause = self.cfg.predictable_window_s if full else 0.0
             return FeedbackEvent(kind="predictable", full=full, reward=reward,
-                                 commands=self._predictable(full), pause_s=0.0)
+                                 commands=self._predictable(full), pause_s=pause)
         pause = (self.cfg.unpredictable_s + self.cfg.pause_after_loss_s) if full else 0.0
         return FeedbackEvent(kind="unpredictable", full=full, reward=reward,
                              commands=self._unpredictable(full), pause_s=pause)
@@ -67,14 +103,15 @@ class RewardGenerator:
     # -- stimulus construction ---------------------------------------------------
 
     def _predictable(self, full: bool) -> list[StimCommand]:
-        """Structured bursts at predictable_hz across all encoding+decoding channels."""
+        """Structured bursts at predictable_hz (full: all channels; mini: sensory only)."""
+        channels = self._feedback_channels if full else self._mini_channels
         n_bursts = self.cfg.predictable_bursts if full else 1
         burst_pulses = max(1, int(round(self.cfg.predictable_hz * self.cfg.predictable_burst_ms / 1000.0)))
         window = self.cfg.predictable_window_s if full else 0.0
         spacing = window / n_bursts if n_bursts > 1 else 0.0
         return [
             StimCommand(
-                channels=self._feedback_channels, rate_hz=self.cfg.predictable_hz,
+                channels=channels, rate_hz=self.cfg.predictable_hz,
                 count=burst_pulses, delay_s=i * spacing,
                 amplitude_ua=self.cfg.feedback_amplitude_ua, tag="reward:predictable",
             )
@@ -83,12 +120,15 @@ class RewardGenerator:
 
     def _unpredictable(self, full: bool) -> list[StimCommand]:
         """Random-site, random-time single stims -- maximally unpredictable input."""
+        channels = self._feedback_channels if full else self._mini_channels
+        if not channels:
+            return []  # layout with no sensory groups: mini feedback has no sites
         duration = self.cfg.unpredictable_s if full else 0.3
         # Event budget scaled like DishBrain's 5 Hz over its 8-electrode sensory area.
-        n_events = max(1, int(round(self.cfg.unpredictable_rate_hz * duration * len(self._feedback_channels) / 8.0)))
+        n_events = max(1, int(round(self.cfg.unpredictable_rate_hz * duration * len(channels) / 8.0)))
         commands = []
         for _ in range(n_events):
-            channel = int(self._rng.choice(self._feedback_channels))
+            channel = int(self._rng.choice(channels))
             delay = float(self._rng.uniform(0.0, duration))
             commands.append(StimCommand(
                 channels=[channel], rate_hz=0.0, count=1, delay_s=delay,

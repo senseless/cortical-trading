@@ -21,14 +21,18 @@ def _directional_accuracy(steps: list[dict]) -> float | None:
 
 
 def episode_metrics(steps: list[dict]) -> dict:
-    actions = Counter(row["action"] for row in steps)
+    # Flatten/roll rows are logged with step=-1: they carry real trades and
+    # feedback but are not decisions the culture made, so they are excluded
+    # from the step count and the action histogram.
+    decisions = [row for row in steps if row.get("step", 0) >= 0]
+    actions = Counter(row["action"] for row in decisions)
     feedback = Counter(row["feedback_kind"] for row in steps if row.get("feedback_kind"))
     closed = [row["closed_trade"] for row in steps if row.get("closed_trade")]
     wins = [t for t in closed if t["dollars"] > 0]
     pnl_dollars = sum(t["dollars"] for t in closed)
     pnl_points = sum(t["points"] for t in closed)
     return {
-        "steps": len(steps),
+        "steps": len(decisions),
         "pnl_points": round(pnl_points, 4),
         "pnl_dollars": round(pnl_dollars, 2),
         "n_trades": len(closed),

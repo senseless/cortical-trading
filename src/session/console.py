@@ -2,9 +2,40 @@
 
 from __future__ import annotations
 
+import sys
+
 from rich.console import Console
 from rich.live import Live
 from rich.table import Table
+
+_QUICK_EDIT = 0x0040
+_EXTENDED_FLAGS = 0x0080
+
+
+def _set_quickedit(enabled: bool) -> int | None:
+    """Windows only: toggle console QuickEdit mode. Returns the prior mode.
+
+    With QuickEdit on (the default), a stray click into the console window
+    starts a text selection that BLOCKS all writes to stdout -- which would
+    freeze the rich Live view, and with it the 20 Hz tick loop that renders
+    it, until someone presses Escape. On real hardware that is a killed
+    session from one misplaced click.
+    """
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.GetStdHandle(-10)  # STD_INPUT_HANDLE
+        mode = ctypes.c_uint32()
+        if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            return None  # no real console (redirected/CI)
+        new_mode = (mode.value | _QUICK_EDIT) if enabled else (mode.value & ~_QUICK_EDIT)
+        if kernel32.SetConsoleMode(handle, new_mode | _EXTENDED_FLAGS):
+            return mode.value
+    except Exception:
+        pass
+    return None
 
 
 class ConsoleView:
@@ -12,9 +43,11 @@ class ConsoleView:
         self.enabled = enabled
         self._live: Live | None = None
         self._console = Console()
+        self._prev_console_mode: int | None = None
 
     def __enter__(self) -> "ConsoleView":
         if self.enabled:
+            self._prev_console_mode = _set_quickedit(False)
             self._live = Live(self._render({}), console=self._console, refresh_per_second=4)
             self._live.__enter__()
         return self
@@ -22,6 +55,13 @@ class ConsoleView:
     def __exit__(self, *exc) -> None:
         if self._live:
             self._live.__exit__(*exc)
+        if self._prev_console_mode is not None:
+            try:
+                import ctypes
+                ctypes.windll.kernel32.SetConsoleMode(
+                    ctypes.windll.kernel32.GetStdHandle(-10), self._prev_console_mode)
+            except Exception:
+                pass
 
     def _render(self, s: dict) -> Table:
         table = Table(title=s.get("title", "cortical trading game"), show_header=False, min_width=64)
@@ -50,4 +90,6 @@ class ConsoleView:
         if self._live:
             self._console.log(message)
         else:
-            print(message)
+            # flush: headless runs are usually piped to a file/log collector,
+            # where block buffering would hold messages back for minutes.
+            print(message, flush=True)

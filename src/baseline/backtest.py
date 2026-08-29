@@ -2,9 +2,11 @@
 
 Uses the same Action semantics the neurons face: BUY from short closes the
 short (one step to flatten, another to reverse), positions are one contract,
-fills cross the spread and pay commission. The luck baseline circularly
-time-shifts the signal stream: same trade structure and frequency, but no
-alignment with prices.
+fills cross the spread and pay commission. Signals execute on the *next* bar:
+the live loop decodes spikes after the step window and fills at the following
+snapshot, so same-bar fills would grant the policy zero-latency lookahead.
+The luck baseline circularly time-shifts the signal stream: same trade
+structure and frequency, but no alignment with prices.
 """
 
 from __future__ import annotations
@@ -49,15 +51,25 @@ def run_policy(
 ) -> BacktestResult:
     engine = GameEngine(instrument, PaperBroker(broker_cfg, instrument))
     equity = np.zeros(len(signals))
-    prev_seg = segment_id[0] if len(segment_id) else 0
-    for i in range(len(signals)):
+    # One-bar execution delay: the signal computed from bar i trades at bar
+    # i+1 (dropped at segment starts -- no stale cross-gap signals).
+    exec_signals = np.zeros_like(signals)
+    if len(signals) > 1:
+        exec_signals[1:] = signals[:-1]
+        exec_signals[np.r_[True, segment_id[1:] != segment_id[:-1]]] = 0
+    # Last bar of each segment: close there, at the segment's own prices.
+    # Flattening on the next segment's first bar would realize the (possibly
+    # hours-wide) gap jump into trade PnL as if it were tradeable. Also never
+    # open a fresh position into a boundary it cannot be held across.
+    seg_last = np.zeros(len(signals), dtype=bool)
+    if len(signals):
+        seg_last[:-1] = segment_id[1:] != segment_id[:-1]
+        seg_last[-1] = True
+        exec_signals[seg_last] = 0
+    for i in range(len(exec_signals)):
         snap = MarketSnapshot(t=float(t[i]), bid=float(bid[i]), ask=float(ask[i]),
                               last=(float(bid[i]) + float(ask[i])) / 2.0)
-        if segment_id[i] != prev_seg:
-            engine.flatten(snap)  # never hold across a data gap
-            engine.on_roll()
-            prev_seg = segment_id[i]
-        target = signals[i]
+        target = exec_signals[i]
         if target > 0 and engine.position <= 0:
             action = Action.BUY
         elif target < 0 and engine.position >= 0:
@@ -65,11 +77,11 @@ def run_policy(
         else:
             action = Action.HOLD
         engine.step(action, snap)
+        if seg_last[i]:
+            engine.flatten(snap)  # never hold across a data gap
+            engine.on_roll()
         # realized_dollars is already net of commissions (Trade.dollars subtracts costs)
         equity[i] = engine.realized_dollars + engine.unrealized_points(snap.mid) * instrument.point_value
-    if len(signals):
-        engine.flatten(MarketSnapshot(t=float(t[-1]), bid=float(bid[-1]), ask=float(ask[-1]),
-                                      last=(float(bid[-1]) + float(ask[-1])) / 2.0))
     trades = engine.trades
     wins = sum(1 for tr in trades if tr.dollars > 0)
     return BacktestResult(
@@ -77,7 +89,7 @@ def run_policy(
         points=round(engine.realized_points, 2),
         n_trades=len(trades),
         win_rate=round(wins / len(trades), 3) if trades else 0.0,
-        n_signals=int(np.count_nonzero(signals)),
+        n_signals=int(np.count_nonzero(exec_signals)),
         equity=equity,
     )
 

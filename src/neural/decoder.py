@@ -12,6 +12,7 @@ features to a next-move prediction.
 
 from __future__ import annotations
 
+import math
 from collections import deque
 
 import numpy as np
@@ -64,10 +65,17 @@ class AgentDecoder:
         for region, count in counts.items():
             mean, std = stats.get(region, (0.0, 0.0))
             if self.cfg.normalization == "zscore":
-                out[region] = (count - mean) / max(std, 1e-6)
+                # Floor the std at the Poisson expectation sqrt(mean): a quiet
+                # baseline with near-zero variance must not turn one stray
+                # spike into a huge z-score (and a runaway constant action).
+                floor = math.sqrt(max(mean, self.cfg.min_baseline_count))
+                out[region] = (count - mean) / max(std, floor)
             else:  # ratio
                 out[region] = count / max(mean, self.cfg.min_baseline_count)
         return out
+
+    def reset(self) -> None:
+        """No per-episode state; present so the runner can reset any decoder."""
 
     def decide(self, channel_counts: np.ndarray, baseline: BaselineTracker) -> tuple[Action, dict]:
         raw = self.region_counts(channel_counts)
@@ -86,7 +94,7 @@ class AgentDecoder:
 class ReservoirDecoder:
     """Linear readout on per-channel spike features (trained offline)."""
 
-    def __init__(self, cfg: DecodingCfg, n_channels: int):
+    def __init__(self, cfg: DecodingCfg, n_channels: int, layout: dict | None = None):
         import joblib
 
         bundle = joblib.load(cfg.readout_path)
@@ -96,8 +104,31 @@ class ReservoirDecoder:
         expected = int(bundle.get("n_channels", n_channels))
         if expected != n_channels:
             raise ValueError(f"readout was trained on {expected} channels, session has {n_channels}")
+        # Channel count alone can't detect an electrode-layout change (a remap
+        # keeps 64 channels but changes what each one means), so compare the
+        # layout fingerprint stored at training time. Compare by content:
+        # channel order within a group is presentation, not meaning.
+        trained_layout = bundle.get("layout")
+        if layout is not None and trained_layout is not None:
+            def _norm(lay: dict) -> dict:
+                return {sec: {k: sorted(v) for k, v in (lay.get(sec) or {}).items()}
+                        for sec in ("sensory", "motor")}
+            if _norm(trained_layout) != _norm(layout):
+                raise ValueError(
+                    f"readout {cfg.readout_path} was trained on a different electrode "
+                    "layout than this session's config; retrain it on current-layout sessions")
         self.prob_threshold = cfg.readout_prob_threshold
         self._buffer: deque[np.ndarray] = deque(maxlen=self.lags + 1)
+
+    def reset(self) -> None:
+        """Clear the lag buffer at episode/roll boundaries.
+
+        The readout is trained on within-episode lag stacks only, so spike
+        windows from before a rest (or from another contract) must not feed
+        the first decisions afterwards; the warmup HOLDs mirror training,
+        which also starts at index `lags` inside each episode.
+        """
+        self._buffer.clear()
 
     def decide(self, channel_counts: np.ndarray, baseline: BaselineTracker | None = None) -> tuple[Action, dict]:
         self._buffer.append(channel_counts.astype(float))

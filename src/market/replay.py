@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import gzip
 import json
+import math
+import zlib
 from pathlib import Path
 
 from ..config import ReplayCfg
@@ -45,8 +47,23 @@ class ReplaySource(MarketSource):
         if first is None:
             raise ValueError(f"replay file {self.path} contains no events")
         self._t0 = float(first["t"])
-        self._apply(first)
+        # Warm up through any leading trade events until the first quote, so
+        # snapshot() never emits NaN bid/ask.
+        ev = first
+        while True:
+            self._apply(ev)
+            if not (math.isnan(self._bid) or math.isnan(self._ask)):
+                break
+            ev = self._next_event()
+            if ev is None:
+                raise ValueError(f"replay file {self.path} contains no quote events")
         self._pending = None
+        if self.cfg.start_offset_s > 0:
+            # Seek to the offset now: done lazily, the first in-loop snapshot()
+            # would decompress and parse potentially hours of events inside a
+            # 50 ms tick budget. This also makes an offset beyond the end of
+            # the recording fail here, before any wetware time is spent.
+            self.snapshot(0.0)
 
     def stop(self) -> None:
         if self._fh:
@@ -54,13 +71,24 @@ class ReplaySource(MarketSource):
             self._fh = None
 
     def _next_event(self) -> dict | None:
-        line = self._fh.readline()
-        while line:
+        while True:
+            try:
+                line = self._fh.readline()
+            except (EOFError, zlib.error):
+                # Truncated or corrupted gzip tail: recorder was killed
+                # mid-write; everything decompressed so far is good data.
+                return None
+            if not line:
+                return None
             line = line.strip()
-            if line:
+            if not line:
+                continue
+            try:
                 return json.loads(line)
-            line = self._fh.readline()
-        return None
+            except json.JSONDecodeError:
+                # Torn line from a crashed recorder -- everything before it is
+                # good data; treat it as the end of the recording.
+                return None
 
     def _apply(self, ev: dict) -> None:
         if ev["type"] == "quote":
@@ -82,7 +110,16 @@ class ReplaySource(MarketSource):
             if ev is None:
                 ev = self._next_event()
                 if ev is None:
-                    break  # end of recording: hold last state
+                    # The session has outlived the recording. Holding the last
+                    # quote would silently simulate a frozen market; fail loudly
+                    # so the session finalizes instead.
+                    raise RuntimeError(
+                        f"replay exhausted: {self.path.name} has no data past "
+                        f"t={target - self._t0:.1f}s of the recording; shorten the "
+                        "session or use a longer recording")
+            if "t" not in ev:
+                ev = None  # mid-file meta (recording path was reused/appended)
+                continue
             if float(ev["t"]) > target:
                 self._pending = ev
                 break

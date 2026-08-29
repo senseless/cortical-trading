@@ -35,15 +35,24 @@ class FeatureTracker:
 
         momentum_pps = 0.0
         window = self.cfg.momentum_window_s
-        anchor = None
-        for t, mid in self._hist:
-            if snap.t - t <= window:
-                anchor = (t, mid)
-                break
-        if anchor and snap.t > anchor[0]:
-            momentum_pps = (snap.mid - anchor[1]) / (snap.t - anchor[0])
+        # Momentum is defined only once a full window of history exists. Right
+        # after a reset the anchor is seconds old, and (mid - anchor)/elapsed
+        # over ~1 s is dominated by noise ~6x the calibrated momentum_scale:
+        # the tanh would saturate in a random direction for the first ~window
+        # seconds of every episode. Until then, report zero (no information).
+        if self._hist and snap.t - self._hist[0][0] >= window:
+            anchor = None
+            for t, mid in self._hist:
+                if snap.t - t <= window:
+                    anchor = (t, mid)
+                    break
+            if anchor and snap.t > anchor[0]:
+                momentum_pps = (snap.mid - anchor[1]) / (snap.t - anchor[0])
 
-        diffs = [b[1] - a[1] for a, b in zip(list(self._hist)[:-1], list(self._hist)[1:])]
+        # Volatility of ~step-scale moves; skip pairs spanning a rest/roll gap
+        # (steps are ~1 s apart -- a > 5 s jump is not a market move).
+        pts = list(self._hist)
+        diffs = [b[1] - a[1] for a, b in zip(pts[:-1], pts[1:]) if b[0] - a[0] <= 5.0]
         vol = statistics.pstdev(diffs) if len(diffs) >= 2 else 0.0
 
         return {

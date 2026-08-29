@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import math
+import sys
 import time
 from pathlib import Path
 
@@ -47,7 +49,9 @@ class SessionRunner:
         self.features = FeatureTracker(cfg.neural.encoding)
         self.encoder = Encoder(cfg.neural.encoding, self.layout, cfg.session.step_interval_s)
         if cfg.session.mode == "reservoir":
-            self.decoder = ReservoirDecoder(cfg.neural.decoding, cfg.neural.channels)
+            self.decoder = ReservoirDecoder(
+                cfg.neural.decoding, cfg.neural.channels,
+                layout={"sensory": cfg.neural.sensory, "motor": cfg.neural.motor})
         else:
             self.decoder = AgentDecoder(cfg.neural.decoding, self.layout)
         self.baseline = BaselineTracker(list(self.layout.motor), cfg.session.baseline_interactions)
@@ -82,105 +86,168 @@ class SessionRunner:
 
         log_fh = open(self.out_dir / "steps.jsonl", "w", encoding="utf-8")
         wall_start = time.time()
+        dropped_stims = 0
 
-        with self.source, ConsoleView(cfg.session.console) as view:
-            view.log(f"market: {self.source.describe()}")
-            contract_desc = getattr(self.source, "contract_desc", "")
-            if contract_desc:
-                view.log(f"contract: {contract_desc}")
-            with cl_mod.open() as neurons:
-                view.log(f"neurons: {backend_name(cl_mod)} | session -> {self.out_dir}")
-                recording = None
-                if cfg.session.record_cl:
-                    recording = neurons.record(
-                        file_location=str(self.out_dir), file_suffix=cfg.session.name,
-                        include_raw_samples=False,
-                        attributes={"label": cfg.session.label, "mode": cfg.session.mode},
-                    )
-                stream = neurons.create_data_stream(
-                    name="trading_game", attributes={"instrument": cfg.instrument.symbol})
-                self._last_stream_ts = 0
+        try:
+            with self.source, ConsoleView(cfg.session.console) as view:
+                view.log(f"market: {self.source.describe()}")
+                contract_desc = getattr(self.source, "contract_desc", "")
+                if contract_desc:
+                    view.log(f"contract: {contract_desc}")
+                with cl_mod.open() as neurons:
+                    view.log(f"neurons: {backend_name(cl_mod)} | session -> {self.out_dir}")
+                    recording = None
+                    if cfg.session.record_cl:
+                        recording = neurons.record(
+                            file_location=str(self.out_dir), file_suffix=cfg.session.name,
+                            include_raw_samples=False,
+                            attributes={"label": cfg.session.label, "mode": cfg.session.mode},
+                        )
+                    stream = neurons.create_data_stream(
+                        name="trading_game", attributes={"instrument": cfg.instrument.symbol})
+                    self._last_stream_ts = 0
 
-                scheduler = StimScheduler(loop_hz)
-                counts = np.zeros(cfg.neural.channels, dtype=np.int64)
-                phase_idx = 0
-                tick_in_phase = 0
-                step_in_episode = 0
-                pause_ticks = 0
-                dropped_stims = 0
+                    scheduler = StimScheduler(loop_hz)
+                    counts = np.zeros(cfg.neural.channels, dtype=np.int64)
+                    phase_idx = 0
+                    tick_in_phase = 0
+                    step_in_episode = 0
+                    pause_ticks = 0
+                    last_stim_end_tick = -(10 ** 9)  # long before the first window
 
-                try:
-                    for tick in neurons.loop(ticks_per_second=loop_hz):
-                        i = tick.iteration
-                        for spike in tick.analysis.spikes:
-                            if 0 <= spike.channel < cfg.neural.channels:
-                                counts[spike.channel] += 1
-                        for cmd in scheduler.due(i):
-                            if not issue(neurons, cl_mod, cmd):
-                                dropped_stims += 1
+                    try:
+                        for tick in neurons.loop(ticks_per_second=loop_hz):
+                            i = tick.iteration
+                            for spike in tick.analysis.spikes:
+                                if 0 <= spike.channel < cfg.neural.channels:
+                                    counts[spike.channel] += 1
+                            due_cmds = scheduler.due(i)
+                            if due_cmds:
+                                last_stim_end_tick = max(last_stim_end_tick, i)
+                            for cmd in due_cmds:
+                                if not issue(neurons, cl_mod, cmd):
+                                    dropped_stims += 1
+                                elif cmd.count > 1 and cmd.rate_hz > 0:
+                                    # A burst keeps playing (count-1)/rate seconds
+                                    # after issue; the baseline stim-free guard
+                                    # must measure from the END of playback, or
+                                    # a sensory burst's tail (up to ~1 s) leaks
+                                    # into the first "spontaneous" window.
+                                    end = i + math.ceil((cmd.count - 1) / cmd.rate_hz * loop_hz)
+                                    last_stim_end_tick = max(last_stim_end_tick, end)
 
-                        if phase_idx >= len(phases):
-                            break
-                        kind, episode, duration = phases[phase_idx]
-                        tick_in_phase += 1
-                        boundary = tick_in_phase % ticks_per_step == 0
+                            if phase_idx >= len(phases):
+                                # Drain before ending: the final flatten's
+                                # feedback is scheduled with delays up to a few
+                                # seconds, and it is already counted and logged
+                                # as delivered -- breaking immediately would
+                                # silently drop it.
+                                if scheduler.pending == 0:
+                                    break
+                                continue
+                            kind, episode, duration = phases[phase_idx]
+                            tick_in_phase += 1
+                            boundary = tick_in_phase % ticks_per_step == 0
 
-                        if kind == "rest" and boundary:
-                            if self.source.pending_roll():
-                                self._handle_roll(neurons, stream, scheduler, i, episode,
-                                                  i / loop_hz, view, log_fh)
-                            region_counts = {r: float(counts[ch].sum()) for r, ch in self.layout.motor.items()}
-                            self.baseline.add_window(region_counts)
-                            counts[:] = 0
-                            view.update(self._view_state(phase="rest", episode=episode, step=self.baseline.n_windows))
-
-                        elif kind == "episode" and boundary:
-                            if pause_ticks > 0:
-                                pause_ticks = max(0, pause_ticks - ticks_per_step)
-                                if pause_ticks == 0:
-                                    counts[:] = 0  # discard noise-period spikes
-                            elif self.source.pending_roll():
-                                # Roll consumes this decision window: flatten, re-anchor, resubscribe.
-                                self._handle_roll(neurons, stream, scheduler, i, episode,
-                                                  i / loop_hz, view, log_fh)
+                            if kind == "rest" and boundary:
+                                if self.source.pending_roll():
+                                    self._handle_roll(neurons, stream, scheduler, i, episode,
+                                                      i / loop_hz, view, log_fh)
+                                # Baseline means *spontaneous* activity: skip any
+                                # window that overlapped stim playback (the
+                                # episode-end feedback tail plays into early rest
+                                # by design, and roll flattens can stim mid-rest).
+                                if i - last_stim_end_tick >= ticks_per_step:
+                                    region_counts = {r: float(counts[ch].sum()) for r, ch in self.layout.motor.items()}
+                                    self.baseline.add_window(region_counts)
                                 counts[:] = 0
-                            else:
-                                t_game = i / loop_hz
-                                pause_s = self._do_step(neurons, stream, scheduler, i, counts, episode,
-                                                        step_in_episode, t_game, view, log_fh)
+                                view.update(self._view_state(phase="rest", episode=episode, step=self.baseline.n_windows))
+
+                            elif kind == "episode" and boundary:
+                                if pause_ticks > 0:
+                                    pause_ticks = max(0, pause_ticks - ticks_per_step)
+                                    if pause_ticks == 0:
+                                        counts[:] = 0  # discard feedback-period spikes
+                                        # Re-prime: no sensory input was delivered
+                                        # during the pause, so without a fresh
+                                        # stimulus the next decision would decode
+                                        # unstimulated spontaneous activity.
+                                        self._prime_episode(scheduler, i, counts)
+                                elif self.source.pending_roll():
+                                    # Roll consumes this decision window: flatten, re-anchor, resubscribe.
+                                    pause_s = self._handle_roll(neurons, stream, scheduler, i, episode,
+                                                                i / loop_hz, view, log_fh)
+                                    counts[:] = 0
+                                    if pause_s > 0:
+                                        # The roll flatten's full feedback must not
+                                        # bleed into the next decision window.
+                                        pause_ticks = round(pause_s * loop_hz)
+                                else:
+                                    t_game = i / loop_hz
+                                    final_step = (tick_in_phase >= duration
+                                                  or step_in_episode + 1 >= cfg.session.steps_per_episode)
+                                    pause_s = self._do_step(neurons, stream, scheduler, i, counts, episode,
+                                                            step_in_episode, t_game, view, log_fh,
+                                                            final_step=final_step)
+                                    counts[:] = 0
+                                    step_in_episode += 1
+                                    if pause_s > 0:
+                                        pause_ticks = round(pause_s * loop_hz)
+
+                            if tick_in_phase >= duration or (kind == "episode" and step_in_episode >= cfg.session.steps_per_episode):
+                                if kind == "episode":
+                                    self._end_episode(neurons, stream, scheduler, i, episode, i / loop_hz, view, log_fh)
+                                    step_in_episode = 0
+                                # Do NOT clear the scheduler here: the final
+                                # step's and the flatten's feedback are scheduled
+                                # on this very tick and must reach the culture
+                                # (they are counted and logged as delivered).
+                                # Baseline purity is preserved by the stim-free
+                                # window guard in the rest branch above.
                                 counts[:] = 0
-                                step_in_episode += 1
-                                if pause_s > 0:
-                                    pause_ticks = round(pause_s * loop_hz)
-
-                        if tick_in_phase >= duration or (kind == "episode" and step_in_episode >= cfg.session.steps_per_episode):
-                            if kind == "episode":
-                                self._end_episode(neurons, stream, scheduler, i, episode, i / loop_hz, view, log_fh)
-                                step_in_episode = 0
-                            phase_idx += 1
-                            tick_in_phase = 0
-                            pause_ticks = 0
-                            if phase_idx < len(phases) and phases[phase_idx][0] == "episode":
-                                # Prime the first decision window with the current market state.
-                                self._prime_episode(scheduler, i, counts)
-                except KeyboardInterrupt:
-                    view.log("interrupted -- finalizing session")
-
-                if recording is not None:
-                    recording.stop()
-
-        log_fh.close()
-        metrics = session_metrics(self.steps_log, cfg.session.score_metric)
-        metrics.update({
-            "label": cfg.session.label,
-            "mode": cfg.session.mode,
-            "market": self.source.describe(),
-            "wall_seconds": round(time.time() - wall_start, 1),
-            "dropped_stims": dropped_stims,
-            "n_predictable": self.n_predictable,
-            "n_unpredictable": self.n_unpredictable,
-        })
-        (self.out_dir / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+                                phase_idx += 1
+                                tick_in_phase = 0
+                                pause_ticks = 0
+                                if phase_idx < len(phases) and phases[phase_idx][0] == "episode":
+                                    # Prime the first decision window with the current market state.
+                                    # The decoder's lag state (reservoir mode) is cleared first:
+                                    # its readout was trained on within-episode lag stacks only,
+                                    # so windows from before the rest must not feed the first
+                                    # decisions of the new episode.
+                                    self.decoder.reset()
+                                    self._prime_episode(scheduler, i, counts)
+                    except KeyboardInterrupt:
+                        view.log("interrupted -- finalizing session")
+                    finally:
+                        # Finalize the HDF5 recording even when the loop dies
+                        # (tick-budget TimeoutError, stream failure): a rented
+                        # wetware session's data must survive its crash.
+                        if recording is not None:
+                            try:
+                                recording.stop()
+                            except Exception:
+                                view.log("warning: recording.stop() failed")
+        finally:
+            failure = sys.exc_info()[1]
+            try:
+                log_fh.close()
+                metrics = session_metrics(self.steps_log, cfg.session.score_metric)
+                metrics.update({
+                    "label": cfg.session.label,
+                    "mode": cfg.session.mode,
+                    "market": self.source.describe(),
+                    "wall_seconds": round(time.time() - wall_start, 1),
+                    "dropped_stims": dropped_stims,
+                    "n_predictable": self.n_predictable,
+                    "n_unpredictable": self.n_unpredictable,
+                })
+                if failure is not None:
+                    metrics["error"] = f"{type(failure).__name__}: {failure}"
+                (self.out_dir / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+            except Exception:
+                if failure is None:
+                    raise  # the metrics write is the only failure; surface it
+                # otherwise never mask the session error with a metrics error
         return metrics
 
     # -----------------------------------------------------------------------
@@ -190,7 +257,7 @@ class SessionRunner:
         return action, debug
 
     def _prime_episode(self, scheduler, now_tick: int, counts: np.ndarray) -> None:
-        """Deliver the sensory stimulus for the current state at episode start."""
+        """Deliver the sensory stimulus for the current state (episode start / pause end)."""
         snap = self.source.snapshot(now_tick / self.cfg.session.loop_hz)
         if snap is None:
             return
@@ -201,7 +268,7 @@ class SessionRunner:
         counts[:] = 0
 
     def _do_step(self, neurons, stream, scheduler, now_tick, counts, episode, step,
-                 t_game, view, log_fh) -> float:
+                 t_game, view, log_fh, final_step: bool = False) -> float:
         """One agent-environment interaction. Returns pause seconds (0 if none)."""
         snap = self.source.snapshot(t_game)
         if snap is None:
@@ -210,7 +277,14 @@ class SessionRunner:
         feats = self.features.update(snap)
         window_counts = counts.copy()
         action, debug = self._decide(window_counts)
-        result = self.engine.step(action, snap)
+        # An open on the episode's final step would be flattened at this same
+        # snapshot moments later: entry at the ask, exit at the bid, a
+        # guaranteed spread+commission loss and a punishment the culture cannot
+        # learn to avoid (it has no time-remaining input). The backtester
+        # already refuses to open into a boundary; mirror it here. The decoded
+        # action is still logged as the culture's prediction.
+        suppressed_open = final_step and self.engine.position == 0 and action != Action.HOLD
+        result = self.engine.step(Action.HOLD if suppressed_open else action, snap)
 
         feedback = None
         if self.cfg.session.mode == "agent":
@@ -222,10 +296,16 @@ class SessionRunner:
                 else:
                     self.n_unpredictable += 1
 
-        sensory = self.encoder.encode_step(feats, self.engine.position, result.unrealized_points)
-        scheduler.schedule(now_tick, sensory)
+        if feedback is None or feedback.pause_s <= 0:
+            sensory = self.encoder.encode_step(feats, self.engine.position, result.unrealized_points)
+            scheduler.schedule(now_tick, sensory)
+        # else: play is paused for the feedback window and the pause-expiry
+        # re-prime delivers fresh sensory state; scheduling sensory here too
+        # would only mix market-dependent stim into the feedback being
+        # delivered (making the "predictable" reward less predictable) and
+        # double the sensory dose around every pause.
 
-        self._log_row(log_fh, stream, neurons, dict(
+        row = dict(
             t=round(t_game, 3), wall_t=time.time(), episode=episode, step=step,
             mid=snap.mid, bid=snap.bid, ask=snap.ask,
             momentum_norm=round(feats["momentum_norm"], 4), vol_points=round(feats["vol_points"], 4),
@@ -240,7 +320,10 @@ class SessionRunner:
             feedback_full=feedback.full if feedback else None,
             decoder=_jsonable(debug),
             counts=window_counts.tolist(),
-        ))
+        )
+        if suppressed_open:
+            row["suppressed_open"] = True  # decoded action logged above; not executed
+        self._log_row(log_fh, stream, neurons, row)
 
         view.update(self._view_state(
             phase="episode", episode=episode, step=step, mid=snap.mid,
@@ -254,14 +337,21 @@ class SessionRunner:
         return feedback.pause_s if feedback else 0.0
 
     def _flatten_with_feedback(self, neurons, stream, scheduler, now_tick, episode,
-                               t_game, log_fh, label: str) -> None:
-        """Force-close any open position; the outcome is real, so feedback still flows."""
+                               t_game, log_fh, label: str) -> tuple[bool, float]:
+        """Force-close any open position; the outcome is real, so feedback still flows.
+
+        Returns (ok, pause_s). ok is False only when a position is open but no
+        quote is available to close it against -- the caller must not proceed
+        as if flat. pause_s is the feedback's play-suspension window: episode-end
+        callers can ignore it (rest follows anyway), but a mid-episode roll must
+        honor it or the full feedback's evoked spikes land in the next decision.
+        """
         snap = self.source.snapshot(t_game)
         if snap is None:
-            return
+            return self.engine.position == 0, 0.0
         result = self.engine.flatten(snap)
         if result is None:
-            return
+            return True, 0.0  # nothing to flatten
         feedback = None
         if self.cfg.session.mode == "agent":
             feedback = self.reward.evaluate(result)
@@ -286,30 +376,46 @@ class SessionRunner:
             feedback_full=feedback.full if feedback else None,
             decoder={}, counts=[],
         ))
+        return True, (feedback.pause_s if feedback else 0.0)
 
     def _end_episode(self, neurons, stream, scheduler, now_tick, episode, t_game, view, log_fh) -> None:
-        self._flatten_with_feedback(neurons, stream, scheduler, now_tick, episode, t_game, log_fh, "flatten")
+        ok, _ = self._flatten_with_feedback(neurons, stream, scheduler, now_tick, episode,
+                                            t_game, log_fh, "flatten")
+        if not ok:
+            view.log(f"warning: episode {episode} position NOT flattened (no market data); "
+                     "it will carry into the next episode")
         view.log(f"episode {episode} done: realized ${self.engine.realized_dollars:+.2f} "
                  f"({len(self.engine.trades)} trades)")
 
-    def _handle_roll(self, neurons, stream, scheduler, now_tick, episode, t_game, view, log_fh) -> None:
+    def _handle_roll(self, neurons, stream, scheduler, now_tick, episode, t_game, view, log_fh) -> float:
         """Contract roll: flatten on the old contract, re-anchor, then resubscribe.
 
         Order matters -- the flatten must execute against the old contract's
         quotes, and the feature window and mark-to-market anchor must be reset
         before the first snapshot of the new contract arrives, so the basis
         jump between contracts never reaches the network or the PnL.
+
+        Returns the flatten feedback's pause window (seconds): a mid-episode
+        caller must suspend play for it, exactly as after a per-step trade
+        close, or the feedback's evoked spikes contaminate the next decision.
         """
         info = self.source.pending_roll()
         if info is None:
-            return
-        self._flatten_with_feedback(neurons, stream, scheduler, now_tick, episode,
-                                    t_game, log_fh, "roll_flatten")
+            return 0.0
+        ok, pause_s = self._flatten_with_feedback(neurons, stream, scheduler, now_tick, episode,
+                                                  t_game, log_fh, "roll_flatten")
+        if not ok:
+            # No quote to close against: do NOT roll with an open position (the
+            # inter-contract basis jump would land in the trade's PnL). The
+            # pending roll persists; retry at the next boundary.
+            return 0.0
         self.features.reset()
+        self.decoder.reset()  # lag windows from the old contract are stale context
         self.engine.on_roll()
         self.source.complete_roll()
         note = f" ({info.note})" if info.note else ""
         view.log(f"contract roll: {info.old_streamer_symbol} -> {info.new_streamer_symbol}{note}")
+        return pause_s
 
     # -----------------------------------------------------------------------
 

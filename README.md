@@ -27,7 +27,7 @@ python -m venv .venv
 .venv\Scripts\python -m pip install -r requirements.txt
 copy .env.example .env   # then fill in tastytrade OAuth credentials (live data only)
 
-# For the GPU-accelerated baseline (NVIDIA): install the CUDA build of torch
+# The silicon baseline requires the CUDA build of torch (NVIDIA):
 .venv\Scripts\python -m pip install torch --index-url https://download.pytorch.org/whl/cu126
 ```
 
@@ -86,9 +86,9 @@ Requires Python 3.11+. Synthetic and replay sessions need no credentials.
    against pre-episode baseline activity, and decoded into an action:
    buy / sell / hold (open long, open short, close long, close short).
 4. The paper broker fills at bid/ask with configurable slippage/commission.
-5. Feedback: profitable outcomes trigger predictable 100 Hz bursts; losses
-   trigger unpredictable random-site stimulation (configurable timing:
-   per-tick, per-trade, or hybrid).
+5. Feedback: net-profitable outcomes (after commissions) trigger predictable
+   100 Hz bursts; net losses trigger unpredictable random-site stimulation
+   (configurable timing: per-tick, per-trade, or hybrid).
 6. Sessions are episodic (default 5 episodes with rest periods, per the
    Cortical Labs gridworld findings) and everything is logged: a JSONL step
    log per session plus the CL HDF5 recording with spikes, stims, and game

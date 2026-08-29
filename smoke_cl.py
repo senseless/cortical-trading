@@ -33,19 +33,21 @@ def main() -> None:
         burst = BurstDesign(4, 40)
 
         t_start = time.time()
-        for tick in neurons.loop(ticks_per_second=20, stop_after_seconds=3):
-            for spike in tick.analysis.spikes:
-                spike_counts[spike.channel] = spike_counts.get(spike.channel, 0) + 1
-            if tick.iteration == 10:
-                neurons.stim(ChannelSet(0, 1, 2, 3), stim_design, burst)
-                stims_issued += 1
-            if tick.iteration == 20:
-                ts = neurons.timestamp()
-                stream.append(ts, {"price": 21000.0, "action": "hold"})
-                stream.set_attribute("score", 1)
+        try:
+            for tick in neurons.loop(ticks_per_second=20, stop_after_seconds=3):
+                for spike in tick.analysis.spikes:
+                    spike_counts[spike.channel] = spike_counts.get(spike.channel, 0) + 1
+                if tick.iteration == 10:
+                    # Channels 1,2,3,5: avoid CL1 reserved channels (0 = unused corner).
+                    neurons.stim(ChannelSet(1, 2, 3, 5), stim_design, burst)
+                    stims_issued += 1
+                if tick.iteration == 20:
+                    ts = neurons.timestamp()
+                    stream.append(ts, {"price": 21000.0, "action": "hold"})
+                    stream.set_attribute("score", 1)
+        finally:
+            recording.stop()  # finalize the .h5 even if the loop raises
         elapsed = time.time() - t_start
-
-        recording.stop()
 
     total_spikes = sum(spike_counts.values())
     channels_seen = sorted(spike_counts)
@@ -55,7 +57,10 @@ def main() -> None:
         print(f"channel range: {channels_seen[0]}..{channels_seen[-1]}")
     print(f"stims issued: {stims_issued}")
 
-    recordings = sorted(OUT_DIR.glob("*.h5"), key=lambda p: p.stat().st_mtime)
+    # Only consider files from THIS run: data/tmp accumulates recordings, and
+    # inspecting a stale one would validate the wrong session.
+    recordings = sorted((p for p in OUT_DIR.glob("*.h5") if p.stat().st_mtime >= t_start - 1),
+                        key=lambda p: p.stat().st_mtime)
     if recordings:
         newest = recordings[-1]
         print(f"recording file: {newest} ({newest.stat().st_size} bytes)")

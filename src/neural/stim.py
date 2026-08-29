@@ -19,6 +19,9 @@ class StimCommand:
     tag: str = ""           # for logging: "sensory:momentum", "reward:predictable", ...
 
 
+MAX_STIM_HZ = 200.0  # CL1 hard limit per channel (cell protection)
+
+
 def issue(neurons, cl_mod, cmd: StimCommand) -> bool:
     """Deliver a StimCommand via the CL API. Returns False if the queue was full."""
     if not cmd.channels:
@@ -28,9 +31,14 @@ def issue(neurons, cl_mod, cmd: StimCommand) -> bool:
     design = cl_mod.StimDesign(width, -abs(cmd.amplitude_ua),
                                width, abs(cmd.amplitude_ua))
     channel_set = cl_mod.ChannelSet(list(cmd.channels))
+    rate_hz = cmd.rate_hz
+    if rate_hz > MAX_STIM_HZ:
+        log.warning("stim rate %.0f Hz for %s exceeds the CL1 %d Hz limit, clamping",
+                    rate_hz, cmd.tag, int(MAX_STIM_HZ))
+        rate_hz = MAX_STIM_HZ
     try:
         if cmd.count > 1:
-            neurons.stim(channel_set, design, cl_mod.BurstDesign(cmd.count, cmd.rate_hz))
+            neurons.stim(channel_set, design, cl_mod.BurstDesign(cmd.count, rate_hz))
         else:
             neurons.stim(channel_set, design)
         return True
@@ -57,6 +65,10 @@ class StimScheduler:
         while self._queue and self._queue[0][0] <= now_tick:
             ready.append(self._queue.pop(0)[1])
         return ready
+
+    @property
+    def pending(self) -> int:
+        return len(self._queue)
 
     def clear(self) -> None:
         self._queue.clear()

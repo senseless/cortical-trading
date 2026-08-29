@@ -44,15 +44,12 @@ product_code = "MBT"          # CME product; front month auto-resolved (MBT = mi
 streamer_symbol = ""          # optional explicit override, e.g. "BTC/USD:CXTALP" for spot crypto
 roll_cutoff_days = 7          # never trade a contract within N days of its last trading day (MBT is monthly)
 roll_check_interval_s = 3600  # re-check the front month this often; on change: flatten, resubscribe, rotate recording
+stale_quote_s = 60            # no quote/trade events for this long -> game idles instead of trading a frozen book (0 = off)
 
 [instrument]
 symbol = "/MBT"
 point_value = 0.1             # $ per point per contract (0.1 BTC, quoted in USD per bitcoin)
 tick_size = 5.0               # $5 per bitcoin minimum tick = $0.50 per contract
-
-[game]
-max_position = 1              # contracts; positions are -1, 0, +1
-flatten_at_episode_end = true
 
 [broker]
 kind = "paper"                # paper | tastytrade (live phase)
@@ -60,7 +57,6 @@ commission_per_side = 2.00    # $ per contract per side: 0.75 commission + 0.30 
 slippage_ticks = 0            # extra ticks beyond crossing the spread
 
 [neural]
-backend = "auto"              # auto | cl | fake  (auto: use cl if importable, else fake)
 channels = 64
 sdk_seed = 42                 # CL_SDK_RANDOM_SEED for deterministic simulator runs (-1 = unseeded)
 
@@ -103,7 +99,7 @@ readout_prob_threshold = 0.6  # reservoir mode: min probability to act
 
 [neural.reward]
 timing = "hybrid"             # per_tick | per_trade | hybrid
-shuffle = false               # true = feedback delivered at random (control condition)
+shuffle = false               # true = control condition: valence resampled from past true outcomes (same rates, no contingency)
 deadband_points = 10.0        # per-tick MTM changes inside deadband get no feedback (~1s BTC noise)
 predictable_hz = 100.0
 predictable_burst_ms = 80.0

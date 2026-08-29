@@ -1,8 +1,10 @@
 """Statistical comparison of two sessions (e.g. experiment vs. random control).
 
-Per-episode scores are the unit of observation, compared with Mann-Whitney U
-(no normality assumption; matches the small-n, non-normal reality of culture
-experiments). Never conclude from a single session -- collect several.
+Per-episode scores are compared with Mann-Whitney U (no normality assumption),
+but episodes within one session share a culture, a day, and one market path:
+they are NOT independent samples, so a p-value from a single session pair is
+pseudoreplicated and descriptive only. The unit of replication for any claim
+about learning is the session (ideally the culture), never the episode.
 """
 
 from __future__ import annotations
@@ -39,8 +41,16 @@ def compare_sessions(dir_a: str | Path, dir_b: str | Path,
         u, p = stats.mannwhitneyu(sa, sb, alternative="two-sided")
         result["mannwhitney_u"] = float(u)
         result["p_value"] = float(p)
-        result["note"] = ("difference unlikely to be chance" if p < 0.05
-                          else "no significant difference (collect more sessions before concluding)")
+        # Episodes within a session are not independent (one culture, one
+        # market path), so this p-value cannot support a significance claim
+        # on its own -- treating it as confirmatory would be pseudoreplication.
+        result["caveat"] = ("episodes are pseudoreplicates: p-value is descriptive of this "
+                            "session pair only; conclude learning from replication across "
+                            "sessions/cultures, not from this test")
+        result["note"] = (f"episode scores differ within this pair (p={p:.3f}); "
+                          "replicate across sessions before drawing conclusions" if p < 0.05
+                          else "no detectable difference in this pair (and single pairs "
+                               "cannot confirm one anyway -- collect more sessions)")
     else:
         result["note"] = "need >= 2 episodes per session for a test"
     return result

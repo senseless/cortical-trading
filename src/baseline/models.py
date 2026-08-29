@@ -23,9 +23,15 @@ def fit_logistic(X_train: np.ndarray, y_train: np.ndarray):
     from sklearn.pipeline import make_pipeline
     from sklearn.preprocessing import StandardScaler
 
+    # No class rebalancing: the gate thresholds predict_proba at 0.5 and
+    # scores accuracy against the majority class, both of which assume
+    # probabilities calibrated to the true class prior. Balanced weights
+    # would shift the decision boundary and manufacture (or hide) edge on
+    # drifting slices. If the model just learns the prior, accuracy lands
+    # on majority_acc and the gate correctly reads "no signal".
     model = make_pipeline(
         StandardScaler(),
-        LogisticRegression(max_iter=2000, class_weight="balanced"),
+        LogisticRegression(max_iter=2000),
     )
     model.fit(X_train, y_train)
 
@@ -75,10 +81,10 @@ def fit_mlp(
     layers.append(nn.Linear(k, 1))
     net = nn.Sequential(*layers).to(device)
 
-    pos = float(y_train.sum())
-    neg = float(len(y_train) - pos)
-    pos_weight = torch.tensor([neg / max(pos, 1.0)], device=device)
-    loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    # Unweighted BCE for the same reason fit_logistic drops class_weight:
+    # the 0.5 threshold and majority-class comparison need probabilities
+    # calibrated to the true prior, not artificially rebalanced ones.
+    loss_fn = nn.BCEWithLogitsLoss()
     opt = torch.optim.Adam(net.parameters(), lr=lr, weight_decay=1e-4)
 
     best_val = float("inf")

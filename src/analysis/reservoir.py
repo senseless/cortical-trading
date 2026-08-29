@@ -9,6 +9,7 @@ neuron cost. Readouts drift with the culture; retrain periodically.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import joblib
@@ -48,8 +49,51 @@ def build_dataset(session_dirs: list[str | Path], lags: int = 2) -> tuple[np.nda
     return np.vstack(xs), np.asarray(ys), int(n_channels)
 
 
+def _session_start_wall_t(session_dir: str | Path) -> float:
+    """Wall-clock time of a session's first logged step (inf when unknown)."""
+    path = Path(session_dir) / "steps.jsonl"
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if line:
+                    return float(json.loads(line).get("wall_t", float("inf")))
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        pass
+    return float("inf")
+
+
+def _session_layout(session_dir: str | Path) -> dict | None:
+    """Electrode layout a session ran with, from its archived config.
+
+    Channel lists are sorted so the fingerprint compares by *content*: the
+    same electrodes written in a different order are the same layout.
+    """
+    path = Path(session_dir) / "config_used.json"
+    if not path.exists():
+        return None
+    neural = json.loads(path.read_text(encoding="utf-8")).get("neural", {})
+    return {"sensory": {k: sorted(v) for k, v in neural.get("sensory", {}).items()},
+            "motor": {k: sorted(v) for k, v in neural.get("motor", {}).items()}}
+
+
 def train_readout(session_dirs: list[str | Path], out_path: str | Path,
                   lags: int = 2) -> dict:
+    # TimeSeriesSplit assumes chronologically ordered rows: sort sessions by
+    # when they actually ran, not by CLI order, so no CV fold trains on data
+    # from the future of its test fold.
+    session_dirs = sorted(session_dirs, key=_session_start_wall_t)
+    # Channel *meaning* must match across training sessions: mixing recordings
+    # made under different electrode layouts silently misaligns features.
+    all_layouts = [_session_layout(d) for d in session_dirs]
+    known = {json.dumps(lay, sort_keys=True): lay for lay in all_layouts if lay is not None}
+    if len(known) > 1:
+        raise ValueError("sessions were recorded under different electrode layouts; "
+                         "train separate readouts per layout")
+    # Vouch for the layout only if EVERY session archived its config; a bundle
+    # stamped with a layout some sessions might not share is false confidence.
+    layout = next(iter(known.values())) if known and all(lay is not None for lay in all_layouts) else None
+
     X, y, n_channels = build_dataset(session_dirs, lags=lags)
     model = make_pipeline(StandardScaler(), LogisticRegression(max_iter=2000, C=0.5))
 
@@ -68,6 +112,7 @@ def train_readout(session_dirs: list[str | Path], out_path: str | Path,
         "scaler": None,           # scaling lives inside the pipeline
         "lags": lags,
         "n_channels": n_channels,
+        "layout": layout,         # electrode layout fingerprint (see ReservoirDecoder)
         "cv_accuracy": accs,
         "majority_baseline": majority,
         "n_samples": int(len(y)),

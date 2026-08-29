@@ -6,17 +6,25 @@ per-contract file, and rolls independently: on a front-month change the feed
 unsubscribes the old contract, subscribes the new one, and rotates its
 recorder. Since nothing is traded here, rolls apply immediately without a
 pending/complete handshake.
+
+dxFeed pushes the last known quote/trade on every (re)subscribe; that
+snapshot is history, not live data, and is never recorded. Combined with the
+recorder's lazy file creation, reconnect cycles against a closed market
+(weekends, CME maintenance) write nothing to disk.
 """
 
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 import threading
 import time
 import traceback
 
 from .recorder import MarketRecorder, default_recording_path
+
+log = logging.getLogger(__name__)
 
 
 def _f(value) -> float:
@@ -32,11 +40,14 @@ class ProductFeed:
         self.trading_symbol = ""    # e.g. /MBTU6
         self.desc = ""
         self.recorder: MarketRecorder | None = None
-        self.quotes = 0
+        self.quotes = 0             # events received (incl. subscribe snapshots)
         self.trades = 0
         self.bid = math.nan
         self.ask = math.nan
         self.last = math.nan
+        # Per-subscription snapshot skips (touched only on the stream thread).
+        self.skip_quote = True
+        self.skip_trade = True
 
 
 class MultiRecorder:
@@ -154,6 +165,8 @@ class MultiRecorder:
             for task in done:
                 if task is not stop_task and task.exception():
                     raise task.exception()
+            if stop_task not in done:
+                raise RuntimeError("market data stream ended unexpectedly")
 
     async def _listen_quotes(self, streamer, Quote) -> None:
         async for q in streamer.listen(Quote):
@@ -170,7 +183,12 @@ class MultiRecorder:
                 feed.quotes += 1
                 self._event_count += 1
             self._connected.set()
-            feed.recorder.quote(now, bid, ask, _f(q.bid_size), _f(q.ask_size))
+            if feed.skip_quote:
+                # dxFeed's subscribe snapshot: valid book, wrong time; the
+                # in-memory state uses it but the recording must not.
+                feed.skip_quote = False
+            else:
+                feed.recorder.quote(now, bid, ask, _f(q.bid_size), _f(q.ask_size))
 
     async def _listen_trades(self, streamer, Trade) -> None:
         async for tr in streamer.listen(Trade):
@@ -187,7 +205,10 @@ class MultiRecorder:
                 feed.trades += 1
                 self._event_count += 1
             self._connected.set()
-            feed.recorder.trade(now, price, _f(tr.size))
+            if feed.skip_trade:
+                feed.skip_trade = False  # subscribe snapshot, see quotes
+            else:
+                feed.recorder.trade(now, price, _f(tr.size))
 
     async def _watch_rolls(self, session) -> None:
         import inspect
@@ -200,7 +221,8 @@ class MultiRecorder:
                 refresh = session.refresh()
                 if inspect.iscoroutine(refresh):
                     await refresh
-            except Exception:
+            except Exception as exc:
+                log.warning("session refresh failed during roll check: %s", exc)
                 continue
             with self._lock:
                 feeds = list(self.feeds.values())
@@ -208,7 +230,8 @@ class MultiRecorder:
                 try:
                     contract, note = await resolve_trading_contract(session, feed.product,
                                                                     self.roll_cutoff_days)
-                except Exception:
+                except Exception as exc:
+                    log.warning("roll check failed for %s: %s", feed.product, exc)
                     continue
                 if contract.streamer_symbol == feed.symbol:
                     continue
@@ -224,11 +247,15 @@ class MultiRecorder:
                                  f"({days_until_stop(contract):.1f}d)")
                     feed.bid = feed.ask = feed.last = math.nan
                     self.feeds[feed.symbol] = feed
-                await self._streamer.subscribe(self._Quote, [feed.symbol])
-                await self._streamer.subscribe(self._Trade, [feed.symbol])
+                # Rotate before subscribing so the new contract's first fresh
+                # events land in the new file (one file never spans two
+                # contracts); the subscribe snapshot itself is skipped.
                 feed.recorder.rotate(feed.symbol, default_recording_path(feed.symbol, self.record_dir),
                                      meta={"trading_symbol": feed.trading_symbol,
                                            "product": feed.product, "rolled_from": old})
+                feed.skip_quote = feed.skip_trade = True
+                await self._streamer.subscribe(self._Quote, [feed.symbol])
+                await self._streamer.subscribe(self._Trade, [feed.symbol])
                 with self._lock:
                     self.notices.append(f"contract roll [{feed.product}]: {old} -> {feed.symbol}"
                                         + (f" ({note})" if note else ""))

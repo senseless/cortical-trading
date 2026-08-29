@@ -14,8 +14,17 @@ def load_session(session_dir: str | Path) -> dict:
     with open(d / "steps.jsonl", encoding="utf-8") as fh:
         for line in fh:
             line = line.strip()
-            if line:
+            if not line:
+                continue
+            try:
                 steps.append(json.loads(line))
-    metrics = json.loads((d / "metrics.json").read_text(encoding="utf-8")) if (d / "metrics.json").exists() else {}
+            except json.JSONDecodeError:
+                break  # torn tail from a hard crash; everything before it is good
+    metrics = {}
+    if (d / "metrics.json").exists():
+        try:
+            metrics = json.loads((d / "metrics.json").read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            metrics = {}  # half-written on crash; steps are still analyzable
     config = json.loads((d / "config_used.json").read_text(encoding="utf-8")) if (d / "config_used.json").exists() else {}
     return {"dir": d, "steps": steps, "metrics": metrics, "config": config}

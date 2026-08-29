@@ -42,22 +42,27 @@ class Encoder:
         cmds: list[StimCommand] = []
         lay = self.layout
 
-        # 1. Momentum: sign -> group (place), magnitude -> rate.
+        # 1. Momentum: sign -> group (place), magnitude -> rate. Exactly zero
+        # (warm-up, or no move) is silence, not a weak "up" -- stimulating the
+        # up group at f_min for unknown momentum would bake in a long bias.
         v = features.get("momentum_norm", 0.0)
-        group = "momentum_up" if v >= 0 else "momentum_down"
-        if lay.has(group):
-            cmds.append(self._burst(lay.group(group), self._rate(v), f"momentum{'+' if v >= 0 else '-'}"))
+        if v != 0.0:
+            group = "momentum_up" if v > 0 else "momentum_down"
+            if lay.has(group):
+                cmds.append(self._burst(lay.group(group), self._rate(v), f"momentum{'+' if v > 0 else '-'}"))
 
         # 2. Position state: pure place coding at a fixed rate (the neurons feel their paddle).
         pos_group = {1: "position_long", 0: "position_flat", -1: "position_short"}[int(position)]
         if lay.has(pos_group):
             cmds.append(self._burst(lay.group(pos_group), self.cfg.position_rate_hz, pos_group))
 
-        # 3. Unrealized PnL: sign -> group, magnitude -> rate. Only while holding a position.
+        # 3. Unrealized PnL: sign -> group, magnitude -> rate. Only while holding
+        # a position; exactly zero (fresh entry) is silence, same as momentum.
         if self.cfg.pnl_channel_enabled and position != 0:
             norm = math.tanh(unrealized_points / self.cfg.pnl_scale_points) if self.cfg.pnl_scale_points else 0.0
-            pnl_group = "pnl_up" if norm >= 0 else "pnl_down"
-            if lay.has(pnl_group):
-                cmds.append(self._burst(lay.group(pnl_group), self._rate(norm), pnl_group))
+            if norm != 0.0:
+                pnl_group = "pnl_up" if norm > 0 else "pnl_down"
+                if lay.has(pnl_group):
+                    cmds.append(self._burst(lay.group(pnl_group), self._rate(norm), pnl_group))
 
         return cmds

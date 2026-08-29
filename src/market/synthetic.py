@@ -42,9 +42,12 @@ class SyntheticSource(MarketSource):
         while self._t + dt <= t:
             z = self._rng.standard_normal()
             self._noise += sigma * math.sqrt(dt) * z
-            # OU: reversion strength scaled by the snr dial (stronger pull = more predictable)
+            # OU: reversion strength scaled by the snr dial (stronger pull = more
+            # predictable). Exact exponential decay instead of explicit Euler:
+            # Euler's (1 - k*dt) factor diverges when k*dt > 2, i.e. an extreme
+            # --snr would silently turn "easiest regime" into numeric overflow.
             k = self.cfg.mean_revert_rate * self.cfg.snr
-            self._ou += -k * self._ou * dt + sigma * math.sqrt(dt) * z
+            self._ou = self._ou * math.exp(-k * dt) + sigma * math.sqrt(dt) * z
             self._t += dt
 
     def _signal(self, t: float) -> float:

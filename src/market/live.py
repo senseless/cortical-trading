@@ -9,13 +9,25 @@ Contract rolls: when the symbol is auto-resolved from a product code, a
 watcher re-resolves it every roll_check_interval_s (honoring roll_cutoff_days,
 see tasty.py). When the answer changes, pending_roll() becomes non-None; the
 driver must flatten its position and reset price-derived state, then call
-complete_roll(), which atomically resubscribes to the new contract, clears the
-stale quote, and rotates the recorder into a fresh file.
+complete_roll(), which schedules the switch on the stream thread and returns
+immediately (the CL closed loop is hard real-time and must never block on
+network I/O). While the switch is in flight, quotes are cleared, so snapshot()
+returns None and the driver skips steps until the new contract streams.
+
+Two staleness rules:
+- snapshot() returns None once no event has arrived for stale_quote_s (CME
+  maintenance windows, dead feeds): the game idles instead of trading -- and
+  the paper broker filling at -- a frozen book.
+- dxFeed pushes the last known quote/trade immediately on (re)subscribe.
+  That snapshot is history, not live data: it updates the in-memory state
+  (the standing book is real) but is NOT recorded, so a connection cycle
+  against a closed market writes nothing to the replay library.
 """
 
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 import threading
 import time
@@ -24,6 +36,8 @@ import traceback
 from ..config import LiveCfg
 from .recorder import MarketRecorder, default_recording_path
 from .source import MarketSnapshot, MarketSource, PendingRoll
+
+log = logging.getLogger(__name__)
 
 
 def _f(value) -> float:
@@ -47,7 +61,14 @@ class LiveSource(MarketSource):
         self._bid_size = self._ask_size = 0.0
         self._quote_count = 0
         self._trade_count = 0
+        self._last_event_wall = 0.0    # wall time of the newest quote/trade event
+        # Per-subscription snapshot skip flags (touched only on the stream
+        # thread's event loop, no lock needed).
+        self._skip_snapshot_quote = True
+        self._skip_snapshot_trade = True
         self._pending_contract = None  # (Future, note) under _lock
+        self._rolling = False          # a roll switch is in flight on the stream thread
+        self._roll_started = 0.0       # wall time complete_roll() was called
         self._connected = threading.Event()
         self._error: BaseException | None = None
         self._error_tb: str = ""
@@ -137,6 +158,11 @@ class LiveSource(MarketSource):
             for task in done:
                 if task is not stop_task and task.exception():
                     raise task.exception()
+            if stop_task not in done:
+                # A listener ended without an exception: the server closed the
+                # stream. Without this, snapshot() would serve the last quote
+                # forever and the game would keep trading a frozen market.
+                raise RuntimeError("market data stream ended unexpectedly")
 
     @staticmethod
     def _describe_contract(contract, days_left: float, note: str) -> str:
@@ -151,10 +177,11 @@ class LiveSource(MarketSource):
 
         from .tasty import days_until_stop, resolve_trading_contract
 
+        failures = 0
         while True:
             await asyncio.sleep(self.cfg.roll_check_interval_s)
             with self._lock:
-                if self._pending_contract is not None:
+                if self._pending_contract is not None or self._rolling:
                     continue  # waiting for the driver to complete the previous roll
             try:
                 refresh = session.refresh()
@@ -163,8 +190,13 @@ class LiveSource(MarketSource):
                 contract, note = await resolve_trading_contract(
                     session, self.cfg.product_code, self.cfg.roll_cutoff_days
                 )
-            except Exception:
-                continue  # transient API failure; retry next interval
+            except Exception as exc:
+                # Transient API failures are expected; persistent ones mean
+                # rolls have silently stopped and the contract will age out.
+                failures += 1
+                log.warning("roll check failed (%d consecutive): %s", failures, exc)
+                continue
+            failures = 0
             if contract.streamer_symbol != self.symbol:
                 with self._lock:
                     self._pending_contract = (contract, note)
@@ -173,6 +205,8 @@ class LiveSource(MarketSource):
 
     def pending_roll(self) -> PendingRoll | None:
         with self._lock:
+            if self._rolling:
+                return None  # switch already in flight
             pending = self._pending_contract
         if pending is None:
             return None
@@ -184,41 +218,61 @@ class LiveSource(MarketSource):
             note=note,
         )
 
-    def complete_roll(self, timeout_s: float = 30.0) -> None:
-        """Switch subscriptions to the pending contract. Flatten first."""
+    def complete_roll(self) -> None:
+        """Schedule the subscription switch on the stream thread. Flatten first.
+
+        Returns immediately: the caller may be inside the CL closed loop's
+        50 ms tick budget, so the network round trips must not be awaited
+        here. Failures surface through snapshot() via self._error.
+        """
         with self._lock:
-            if self._pending_contract is None:
+            if self._pending_contract is None or self._rolling:
                 return
+            self._rolling = True
+            self._roll_started = time.time()
         if self._error or not self._loop or self._loop.is_closed():
+            with self._lock:
+                self._rolling = False
             raise RuntimeError(f"cannot roll: stream is not running ({self._error})")
-        future = asyncio.run_coroutine_threadsafe(self._apply_roll(), self._loop)
-        future.result(timeout=timeout_s)
+        asyncio.run_coroutine_threadsafe(self._apply_roll(), self._loop)
 
     async def _apply_roll(self) -> None:
         from .tasty import days_until_stop
 
-        with self._lock:
-            pending = self._pending_contract
-        if pending is None:
-            return
-        contract, note = pending
-        old = self.symbol
-        await self._streamer.unsubscribe(self._Quote, [old])
-        await self._streamer.unsubscribe(self._Trade, [old])
-        with self._lock:
-            self._bid = self._ask = self._last = math.nan
-            self._bid_size = self._ask_size = 0.0
-        self.symbol = contract.streamer_symbol
-        self.trading_symbol = contract.symbol
-        self.contract_desc = self._describe_contract(contract, days_until_stop(contract), note)
-        await self._streamer.subscribe(self._Quote, [self.symbol])
-        await self._streamer.subscribe(self._Trade, [self.symbol])
-        if self.recorder:
-            new_path = default_recording_path(self.symbol, self.recorder.path.parent)
-            self.recorder.rotate(self.symbol, new_path, meta={"trading_symbol": self.trading_symbol,
-                                                              "rolled_from": old})
-        with self._lock:
-            self._pending_contract = None
+        try:
+            with self._lock:
+                pending = self._pending_contract
+            if pending is None:
+                return
+            contract, note = pending
+            old = self.symbol
+            await self._streamer.unsubscribe(self._Quote, [old])
+            await self._streamer.unsubscribe(self._Trade, [old])
+            with self._lock:
+                self._bid = self._ask = self._last = math.nan
+                self._bid_size = self._ask_size = 0.0
+            self.symbol = contract.streamer_symbol
+            self.trading_symbol = contract.symbol
+            self.contract_desc = self._describe_contract(contract, days_until_stop(contract), note)
+            # Rotate the recorder *before* subscribing so the new contract's
+            # first fresh events land in the new file (one file never spans
+            # two contracts). The subscribe snapshot itself is skipped (it is
+            # history, not live data); stale old-contract events are dropped
+            # by the symbol filter meanwhile.
+            if self.recorder:
+                new_path = default_recording_path(self.symbol, self.recorder.path.parent)
+                self.recorder.rotate(self.symbol, new_path, meta={"trading_symbol": self.trading_symbol,
+                                                                  "rolled_from": old})
+            self._skip_snapshot_quote = self._skip_snapshot_trade = True
+            await self._streamer.subscribe(self._Quote, [self.symbol])
+            await self._streamer.subscribe(self._Trade, [self.symbol])
+        except BaseException as exc:
+            self._error = exc
+            self._error_tb = traceback.format_exc()
+        finally:
+            with self._lock:
+                self._pending_contract = None
+                self._rolling = False
 
     # -- event listeners -------------------------------------------------------
 
@@ -234,8 +288,13 @@ class LiveSource(MarketSource):
                 self._bid, self._ask = bid, ask
                 self._bid_size, self._ask_size = _f(q.bid_size), _f(q.ask_size)
                 self._quote_count += 1
+                self._last_event_wall = now
             self._connected.set()
-            if self.recorder:
+            if self._skip_snapshot_quote:
+                # First quote after (re)subscribe is dxFeed's snapshot of the
+                # last known state -- valid book, wrong time; don't record it.
+                self._skip_snapshot_quote = False
+            elif self.recorder:
                 self.recorder.quote(now, bid, ask, _f(q.bid_size), _f(q.ask_size))
 
     async def _listen_trades(self, streamer, Trade) -> None:
@@ -249,8 +308,11 @@ class LiveSource(MarketSource):
             with self._lock:
                 self._last = price
                 self._trade_count += 1
+                self._last_event_wall = now
             self._connected.set()
-            if self.recorder:
+            if self._skip_snapshot_trade:
+                self._skip_snapshot_trade = False  # subscribe snapshot, see quotes
+            elif self.recorder:
                 self.recorder.trade(now, price, _f(tr.size))
 
     # -- reads ---------------------------------------------------------------
@@ -260,12 +322,32 @@ class LiveSource(MarketSource):
         with self._lock:
             return self._quote_count, self._trade_count
 
+    ROLL_TIMEOUT_S = 60.0  # watchdog for the async subscription switch
+
     def snapshot(self, t: float) -> MarketSnapshot | None:
         if self._error:
             raise RuntimeError(f"DXLink stream failed: {self._error}") from self._error
         with self._lock:
+            rolling, roll_started = self._rolling, self._roll_started
             bid, ask, last = self._bid, self._ask, self._last
             bs, as_ = self._bid_size, self._ask_size
+            last_event = self._last_event_wall
+        stale_s = self.cfg.stale_quote_s
+        if stale_s > 0 and last_event > 0 and time.time() - last_event > stale_s:
+            # No event for stale_quote_s: maintenance window or dead feed.
+            # Serving the cached book would let the game fill paper trades at
+            # prices nobody can actually trade; idle instead until data flows.
+            return None
+        if rolling:
+            # The switch is in flight on the stream thread; until it clears the
+            # cache, bid/ask still belong to the OLD contract the caller just
+            # flattened. Serve nothing rather than let the game trade it. If
+            # the switch hangs, fail loudly instead of starving forever.
+            if time.time() - roll_started > self.ROLL_TIMEOUT_S:
+                raise RuntimeError(
+                    f"contract roll did not complete within {self.ROLL_TIMEOUT_S:.0f}s "
+                    "(subscription switch hung on the stream thread)")
+            return None
         if math.isnan(bid) or math.isnan(ask):
             return None
         if math.isnan(last):

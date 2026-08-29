@@ -19,11 +19,17 @@ detects stalled streams, and starts a fresh timestamped file every rotation
 interval so no single file grows unbounded. Note: equity/commodity products
 only tick Sun 6pm - Fri 5pm ET; over the weekend only crypto (MBT, MET)
 produces events, which is what keeps the stall detector fed.
+
+Closed markets cost no disk: recording files are only created when the first
+fresh event arrives, and dxFeed's on-subscribe snapshot (last known state,
+stale timestamp) is never recorded -- so stall/reconnect cycles against a
+quiet market write nothing.
 """
 
 from __future__ import annotations
 
 import argparse
+import socket
 import time
 
 from src.config import LiveCfg
@@ -31,6 +37,19 @@ from src.market.live import LiveSource
 from src.market.multi_recorder import MultiRecorder
 
 STALL_TIMEOUT_S = 600.0  # no events for this long = stream is dead; reconnect
+SINGLETON_PORT = 47113   # one --forever builder per machine (IDE terminal restore spawns duplicates)
+
+
+def acquire_singleton() -> socket.socket | None:
+    """Bind a fixed localhost port as a machine-wide instance lock."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.bind(("127.0.0.1", SINGLETON_PORT))
+        s.listen(1)
+        return s
+    except OSError:
+        s.close()
+        return None
 
 
 def record_once(args, duration_s: float, stall_timeout_s: float = 0.0) -> None:
@@ -43,7 +62,7 @@ def record_once(args, duration_s: float, stall_timeout_s: float = 0.0) -> None:
           flush=True)
     source.start()
     print(f"contract: {source.contract_desc}", flush=True)
-    print(f"recording {source.symbol} -> {source.recorder.path}", flush=True)
+    print(f"recording {source.symbol} -> {source.recorder.path} (file created on first event)", flush=True)
 
     started = time.time()
     last_events = 0
@@ -55,9 +74,11 @@ def record_once(args, duration_s: float, stall_timeout_s: float = 0.0) -> None:
             if roll:
                 source.complete_roll()  # nothing to flatten while recording
                 note = f" ({roll.note})" if roll.note else ""
-                print(f"contract roll: {roll.old_streamer_symbol} -> {roll.new_streamer_symbol}{note}",
-                      flush=True)
-                print(f"recording continues -> {source.recorder.path}", flush=True)
+                # The switch is async (stream thread); the recorder rotates to a
+                # new file when it completes, so don't print the (still old)
+                # recorder path here.
+                print(f"contract roll: {roll.old_streamer_symbol} -> {roll.new_streamer_symbol}{note} "
+                      "-- recorder rotates when the switch completes", flush=True)
             q, tr = source.counts
             snap = source.snapshot(0)
             px = f"bid {snap.bid} / ask {snap.ask} last {snap.last}" if snap else "no quote yet"
@@ -73,8 +94,11 @@ def record_once(args, duration_s: float, stall_timeout_s: float = 0.0) -> None:
                 break
     finally:
         source.stop()
-        q, tr = source.counts
-        print(f"saved {q} quotes, {tr} trades (last file: {source.recorder.path})", flush=True)
+        rec = source.recorder
+        if rec is not None and (rec.quotes or rec.trades):
+            print(f"saved {rec.quotes} quotes, {rec.trades} trades (last file: {rec.path})", flush=True)
+        else:
+            print("no fresh events received -- no recording file created", flush=True)
 
 
 def record_multi_once(products: list[str], duration_s: float, stall_timeout_s: float = 0.0) -> None:
@@ -124,6 +148,8 @@ def main() -> None:
     args = parser.parse_args()
 
     products = [p.strip().upper() for p in args.product.split(",") if p.strip()]
+    if products:
+        args.product = products[0]  # single-product path needs the uppercased code too
     multi = len(products) > 1
     if multi and (args.symbol or args.out):
         print("--symbol/--out are ignored in multi-product mode")
@@ -142,6 +168,11 @@ def main() -> None:
             print("stopping...")
         return
 
+    lock = acquire_singleton()
+    if lock is None:
+        print(f"another --forever recorder is already running (port {SINGLETON_PORT} bound); exiting")
+        return
+
     if args.out:
         print("--out is ignored in --forever mode (files are timestamped per rotation)")
         args.out = ""
@@ -158,7 +189,11 @@ def main() -> None:
         except Exception as exc:
             print(f"[{time.strftime('%H:%M:%S')}] recorder error: {exc}; retrying in {backoff:.0f}s",
                   flush=True)
-            time.sleep(backoff)
+            try:
+                time.sleep(backoff)
+            except KeyboardInterrupt:
+                print("stopping...")
+                return
             backoff = min(backoff * 2, 300.0)
 
 

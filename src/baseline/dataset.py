@@ -22,6 +22,7 @@ from __future__ import annotations
 import gzip
 import json
 import math
+import zlib
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -62,8 +63,8 @@ def load_recording_series(path: str | Path, step_s: float = 1.0, max_gap_s: floa
                     continue  # torn tail line in a live file
                 if ev.get("type") == "quote":
                     quotes.append((ev["t"], ev["bid"], ev["ask"], ev.get("bs", 0.0), ev.get("as", 0.0)))
-    except EOFError:
-        pass  # file still being written; use what decompressed cleanly
+    except (EOFError, zlib.error):
+        pass  # truncated/corrupted tail (crashed or live recorder); use what decompressed cleanly
     if len(quotes) < 2:
         raise RuntimeError(f"{path}: not enough quotes to build a series")
     quotes.sort(key=lambda q: q[0])
@@ -79,6 +80,10 @@ def load_recording_series(path: str | Path, step_s: float = 1.0, max_gap_s: floa
             segments.append(_segment_from_rows(rows))
             rows = []
             grid_t = nxt[0]
+            # The new segment must start from the first post-gap quote; carrying
+            # the pre-gap quote forward would plant a phantom price jump at the
+            # segment start (and inflate rolling-vol features for minutes).
+            last = nxt
         while grid_t <= nxt[0]:
             rows.append((grid_t, last[1], last[2], last[3], last[4]))
             grid_t += step_s
@@ -257,9 +262,18 @@ def build_dataset(
     n = ds.n
     i_train = int(n * train_frac)
     i_val = int(n * (train_frac + val_frac))
-    for name, sl in (("train", slice(0, i_train)), ("val", slice(i_train, i_val)), ("test", slice(i_val, n))):
+    # Purge max_h rows before each boundary: labels look up to max_h steps
+    # ahead, so without the gap the tail of one split is labeled with prices
+    # from inside the next (leakage across the temporal split).
+    for name, sl in (("train", slice(0, max(0, i_train - max_h))),
+                     ("val", slice(i_train, max(i_train, i_val - max_h))),
+                     ("test", slice(i_val, n))):
         mask = np.zeros(n, dtype=bool)
         mask[sl] = True
+        if not mask.any():
+            raise ValueError(
+                f"'{name}' split is empty after the {max_h}-row purge ({n} usable rows "
+                "total); use a longer recording or shorter/fewer horizons")
         ds.splits[name] = mask
     return ds
 
