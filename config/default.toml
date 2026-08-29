@@ -1,0 +1,115 @@
+# Default configuration for a trading-game session.
+# Copy and edit for experiments; every session archives the config it ran with.
+
+[session]
+name = "dev"
+label = "experiment"          # free-form tag, e.g. "control-random", "culture-A"
+mode = "agent"                # agent (motor regions + feedback) | reservoir (trained readout)
+episodes = 5
+steps_per_episode = 120       # env steps per episode (1 step ~= step_interval_s)
+step_interval_s = 1.0         # seconds between action opportunities (~1 Hz per CL gridworld paper)
+rest_s = 90                   # rest/baseline period before and between episodes
+baseline_interactions = 60    # baseline windows used for spike-count normalization
+loop_hz = 20                  # CL closed-loop tick rate (budget 50 ms per tick)
+accelerated = false           # true = decouple from wall clock (simulator only, non-live sources)
+score_metric = "pnl_after_costs"   # pnl_after_costs | directional_accuracy
+output_dir = "data/sessions"
+record_cl = true              # also produce the CL HDF5 recording
+console = true                # live console view
+
+[market]
+source = "synthetic"          # synthetic | replay | live
+
+[market.synthetic]
+regime = "sine"               # sine | trend | trend_noise | mean_revert | random_walk
+seed = 42
+start_price = 78000.0         # ~BTC level so synthetic runs share MBT-scaled parameters
+spread = 40.0                 # quoted spread in points (observed /MBT off-peak: 35-45)
+dt_s = 0.1                    # internal simulation resolution
+# signal parameters
+amplitude = 150.0             # sine amplitude (points)
+period_s = 120.0              # sine period
+drift_per_s = 1.0             # trend drift (points/s)
+mean_revert_rate = 0.05       # OU reversion rate (1/s)
+noise_vol = 7.0               # noise sigma (points per sqrt(s)); ~BTC realized vol at seconds scale
+snr = 4.0                     # signal-to-noise dial: scales signal relative to noise (higher = easier)
+
+[market.replay]
+path = ""                     # path to a .jsonl or .jsonl.gz file from the replay library
+speed = 1.0                   # playback speed multiplier
+start_offset_s = 0.0
+
+[market.live]
+product_code = "MBT"          # CME product; front month auto-resolved (MBT = micro bitcoin, 24/7 since 2026-05-29)
+streamer_symbol = ""          # optional explicit override, e.g. "BTC/USD:CXTALP" for spot crypto
+roll_cutoff_days = 7          # never trade a contract within N days of its last trading day (MBT is monthly)
+roll_check_interval_s = 3600  # re-check the front month this often; on change: flatten, resubscribe, rotate recording
+
+[instrument]
+symbol = "/MBT"
+point_value = 0.1             # $ per point per contract (0.1 BTC, quoted in USD per bitcoin)
+tick_size = 5.0               # $5 per bitcoin minimum tick = $0.50 per contract
+
+[game]
+max_position = 1              # contracts; positions are -1, 0, +1
+flatten_at_episode_end = true
+
+[broker]
+kind = "paper"                # paper | tastytrade (live phase)
+commission_per_side = 2.00    # $ per contract per side: 0.75 commission + 0.30 clearing + exchange/NFA estimate (verify on statement)
+slippage_ticks = 0            # extra ticks beyond crossing the spread
+
+[neural]
+backend = "auto"              # auto | cl | fake  (auto: use cl if importable, else fake)
+channels = 64
+sdk_seed = 42                 # CL_SDK_RANDOM_SEED for deterministic simulator runs (-1 = unseeded)
+
+# Electrode layout: channel indices 0..channels-1, no overlaps.
+# Sensory groups receive stimulation; motor regions are read for decoding.
+# CL1 hardware reserves 5 of the 64 channels: 0, 7, 56, 63 (unused grid
+# corners) and 4 (measurement reference). Never assign them — the simulator
+# accepts them but on real hardware those stims are silently dead.
+[neural.layout.sensory]
+momentum_up = [1, 2, 3, 5]    # column 1 of the 8x8 grid, skipping reserved 0 and 4
+momentum_down = [8, 9, 10, 11]
+position_long = [16, 17]
+position_flat = [24, 25]
+position_short = [32, 33]
+pnl_up = [20, 21]             # one row below position_long, gap limits cross-talk
+pnl_down = [28, 29]           # one row below position_flat
+
+[neural.layout.motor]
+buy = [40, 41, 42, 43, 48, 49, 50, 51]
+sell = [44, 45, 46, 47, 52, 53, 54, 55]
+
+[neural.encoding]
+# Defaults follow Cortical Labs' large-scale optimization (arXiv:2605.13315)
+f_min_hz = 4.0
+f_max_hz = 40.0
+amplitude_ua = 2.5
+pulse_width_us = 80.0
+position_rate_hz = 8.0        # fixed rate for the place-coded position group
+pnl_channel_enabled = true
+momentum_window_s = 30.0
+momentum_scale = 1.2          # points/s that saturates the momentum signal (~1 sigma of BTC 30s drift)
+pnl_scale_points = 200.0      # unrealized PnL (points) that saturates the pnl signal ($20 on MBT)
+
+[neural.decoding]
+normalization = "ratio"       # ratio | zscore (vs. pre-episode baseline spontaneous activity)
+threshold = 0.25              # differential activity needed to act (else hold)
+min_baseline_count = 1.0      # floor for baseline means to avoid divide-by-zero
+readout_path = ""             # reservoir mode: path to trained readout bundle (.joblib)
+readout_prob_threshold = 0.6  # reservoir mode: min probability to act
+
+[neural.reward]
+timing = "hybrid"             # per_tick | per_trade | hybrid
+shuffle = false               # true = feedback delivered at random (control condition)
+deadband_points = 10.0        # per-tick MTM changes inside deadband get no feedback (~1s BTC noise)
+predictable_hz = 100.0
+predictable_burst_ms = 80.0
+predictable_bursts = 5        # full reward: N bursts spread over feedback window
+predictable_window_s = 1.0
+unpredictable_s = 2.0         # full punishment: noise duration
+unpredictable_rate_hz = 5.0   # per-site event rate for random stimulation
+pause_after_loss_s = 1.0      # extra quiet pause after punishment before play resumes
+feedback_amplitude_ua = 2.5

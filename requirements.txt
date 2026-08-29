@@ -1,0 +1,15 @@
+numpy>=1.26
+pandas>=2.1
+scipy>=1.11
+scikit-learn>=1.4
+matplotlib>=3.8
+rich>=13.7
+python-dotenv>=1.0
+websockets>=12.0
+httpx>=0.27
+joblib>=1.3
+h5py>=3.10
+tastytrade
+cl-sdk
+# baseline MLP; for NVIDIA GPU use: pip install torch --index-url https://download.pytorch.org/whl/cu126
+torch>=2.4
