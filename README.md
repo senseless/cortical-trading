@@ -9,7 +9,7 @@ unpredictable noise after adverse ones (free energy principle).
 
 /MBT was chosen because CME moved cryptocurrency futures to 24/7 trading in
 May 2026 (only maintenance gaps: 2 min on weekdays, 2 h on Saturday mornings),
-which triples the live training hours available per rented CL1 month compared
+which increases training hours available per rented CL1 month compared
 to equity index futures and removes weekend gap risk.
 
 Phase 1 runs entirely against the free CL SDK simulator (`cl-sdk`) with an
