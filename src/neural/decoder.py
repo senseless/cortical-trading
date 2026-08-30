@@ -106,13 +106,18 @@ class ReservoirDecoder:
             raise ValueError(f"readout was trained on {expected} channels, session has {n_channels}")
         # Channel count alone can't detect an electrode-layout change (a remap
         # keeps 64 channels but changes what each one means), so compare the
-        # layout fingerprint stored at training time. Compare by content:
-        # channel order within a group is presentation, not meaning.
+        # layout fingerprint stored at training time. Sensory groups are
+        # compared order-sensitively because the momentum strips are
+        # topographic -- reordering a strip rescrambles the timescale axis
+        # while keeping the same channels. Motor groups are compared as sets,
+        # since decoding only sums their counts.
         trained_layout = bundle.get("layout")
         if layout is not None and trained_layout is not None:
             def _norm(lay: dict) -> dict:
-                return {sec: {k: sorted(v) for k, v in (lay.get(sec) or {}).items()}
-                        for sec in ("sensory", "motor")}
+                return {
+                    "sensory": {k: list(v) for k, v in (lay.get("sensory") or {}).items()},
+                    "motor": {k: sorted(v) for k, v in (lay.get("motor") or {}).items()},
+                }
             if _norm(trained_layout) != _norm(layout):
                 raise ValueError(
                     f"readout {cfg.readout_path} was trained on a different electrode "

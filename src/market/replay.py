@@ -71,9 +71,13 @@ class ReplaySource(MarketSource):
             self._fh = None
 
     def _next_event(self) -> dict | None:
+        return self._read_event(self._fh)
+
+    @staticmethod
+    def _read_event(fh) -> dict | None:
         while True:
             try:
-                line = self._fh.readline()
+                line = fh.readline()
             except (EOFError, zlib.error):
                 # Truncated or corrupted gzip tail: recorder was killed
                 # mid-write; everything decompressed so far is good data.
@@ -99,6 +103,55 @@ class ReplaySource(MarketSource):
         elif ev["type"] == "trade":
             self._last = float(ev["price"])
         self.events_consumed += 1
+
+    def preroll(self, duration_s: float, step_s: float = 1.0) -> list[MarketSnapshot]:
+        """Resample the recording before the start offset onto the step grid.
+
+        Timestamps are negative game time ending just before 0, consistent
+        with snapshot()'s axis (a speed multiplier maps duration_s of game
+        time to duration_s * speed of recording time). With start_offset_s=0
+        the recording has no history before the session and this returns [];
+        point the offset at least duration_s * speed into the recording to
+        start with a fully warm strip. Quotes are carried forward through
+        recording gaps -- momentum across a maintenance window reads as a
+        slow drift rather than splitting the history.
+        """
+        if self._t0 is None:
+            raise RuntimeError("ReplaySource.start() not called")
+        if duration_s <= 0 or self.cfg.start_offset_s <= 0:
+            return []
+        speed = self.cfg.speed
+        end_abs = self._t0 + self.cfg.start_offset_s
+        start_abs = end_abs - duration_s * speed
+        fh = gzip.open(self.path, "rt", encoding="utf-8") if self.path.suffix == ".gz" \
+            else open(self.path, "r", encoding="utf-8")
+        snaps: list[MarketSnapshot] = []
+        bid = ask = last = float("nan")
+        grid = start_abs
+        try:
+            while True:
+                ev = self._read_event(fh)
+                if ev is None:
+                    break
+                if "t" not in ev:
+                    continue  # meta line
+                t_ev = float(ev["t"])
+                while grid < min(t_ev, end_abs):
+                    if not (math.isnan(bid) or math.isnan(ask)):
+                        mid = (bid + ask) / 2.0
+                        snaps.append(MarketSnapshot(
+                            t=(grid - end_abs) / speed, bid=bid, ask=ask,
+                            last=mid if math.isnan(last) else last))
+                    grid += step_s * speed
+                if t_ev >= end_abs:
+                    break
+                if ev["type"] == "quote":
+                    bid, ask = float(ev["bid"]), float(ev["ask"])
+                elif ev["type"] == "trade":
+                    last = float(ev["price"])
+        finally:
+            fh.close()
+        return snaps
 
     def snapshot(self, t: float) -> MarketSnapshot | None:
         if self._t0 is None:

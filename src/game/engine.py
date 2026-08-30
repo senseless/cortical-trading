@@ -18,48 +18,116 @@ from .state import Action, StepResult, Trade
 
 
 class FeatureTracker:
-    """Rolling market features derived from snapshots at each game step."""
+    """Rolling market features derived from snapshots at each game step.
+
+    Momentum is computed over the configured ladder of windows -- the
+    chronotopic strip -- one velocity per window, each normalized by its own
+    scale (see EncodingCfg.scale_for_window). A window reports exactly zero
+    until that much market history exists: right after a reset the anchor is
+    seconds old, and (mid - anchor)/elapsed over ~1 s is noise several times
+    the calibrated scale, so the tanh would saturate in a random direction.
+    Zero means "no information" and the encoder renders it as silence, so the
+    strip's long end simply stays dark until it has the history to speak.
+
+    With hour-scale windows on the ladder, waiting for in-session history is
+    not an option (nobody rents 8 hours of wetware warm-up), so seed() accepts
+    pre-roll history from the market source -- recorded data before the replay
+    offset, backfilled candles on live, generated path on synthetic -- and the
+    whole strip is live from the first step.
+
+    Window anchors advance monotonically (one cursor per window) instead of
+    rescanning history, because the ladder retains hours of quotes and the
+    baseline dataset builder calls update() once per row of a recording.
+    """
+
+    VOL_WINDOW_S = 60.0     # volatility is a step-scale statistic, not part of the ladder
+    _COMPACT_AT = 4096      # drop consumed history once this many samples are dead
 
     def __init__(self, cfg: EncodingCfg):
         self.cfg = cfg
-        self._hist: deque[tuple[float, float]] = deque()
+        self.windows: list[float] = list(cfg.momentum_windows_s)
+        self.scales: list[float] = cfg.momentum_scales
+        self._t: list[float] = []
+        self._mid: list[float] = []
+        self._head = 0                              # oldest live sample
+        self._cursor = [0] * len(self.windows)      # per-window anchor
+        self._vol: deque[tuple[float, float]] = deque()
 
     def reset(self) -> None:
-        self._hist.clear()
+        self._t.clear()
+        self._mid.clear()
+        self._head = 0
+        self._cursor = [0] * len(self.windows)
+        self._vol.clear()
 
-    def update(self, snap: MarketSnapshot) -> dict[str, float]:
-        self._hist.append((snap.t, snap.mid))
-        horizon = max(self.cfg.momentum_window_s * 2, 60.0)
-        while self._hist and snap.t - self._hist[0][0] > horizon:
-            self._hist.popleft()
+    def seed(self, snaps: list[MarketSnapshot]) -> None:
+        """Prepend pre-roll history so the long windows speak immediately.
 
-        momentum_pps = 0.0
-        window = self.cfg.momentum_window_s
-        # Momentum is defined only once a full window of history exists. Right
-        # after a reset the anchor is seconds old, and (mid - anchor)/elapsed
-        # over ~1 s is dominated by noise ~6x the calibrated momentum_scale:
-        # the tanh would saturate in a random direction for the first ~window
-        # seconds of every episode. Until then, report zero (no information).
-        if self._hist and snap.t - self._hist[0][0] >= window:
-            anchor = None
-            for t, mid in self._hist:
-                if snap.t - t <= window:
-                    anchor = (t, mid)
-                    break
-            if anchor and snap.t > anchor[0]:
-                momentum_pps = (snap.mid - anchor[1]) / (snap.t - anchor[0])
+        Only snapshots older than the oldest live sample are used: a live
+        source's backfill arrives seconds after real quotes started flowing
+        (async candle fetch after a roll), and appending those older times
+        would break the monotonic-time assumption the cursors rely on.
+        Volatility is left untouched -- it is a step-scale statistic and
+        pre-roll history is far coarser than the step grid.
+        """
+        if self._head:
+            del self._t[:self._head]
+            del self._mid[:self._head]
+            self._head = 0
+        cut = self._t[0] if self._t else math.inf
+        hist = sorted((s.t, s.mid) for s in snaps if s.t < cut)
+        if not hist:
+            return
+        self._t[:0] = [t for t, _ in hist]
+        self._mid[:0] = [m for _, m in hist]
+        self._cursor = [0] * len(self.windows)
+
+    def update(self, snap: MarketSnapshot) -> dict[str, float | list[float]]:
+        self._t.append(snap.t)
+        self._mid.append(snap.mid)
+        now, mid = snap.t, snap.mid
+
+        # Retain a little more than the longest window so its anchor exists.
+        retain = self.windows[-1] + 60.0
+        n = len(self._t)
+        while self._head < n - 1 and now - self._t[self._head] > retain:
+            self._head += 1
+        if self._head >= self._COMPACT_AT:
+            del self._t[:self._head]
+            del self._mid[:self._head]
+            self._cursor = [max(0, c - self._head) for c in self._cursor]
+            self._head = 0
+            n = len(self._t)
+
+        history_s = now - self._t[self._head]
+        pps: list[float] = []
+        norms: list[float] = []
+        for k, window in enumerate(self.windows):
+            c = max(self._cursor[k], self._head)
+            while c + 1 < n and now - self._t[c] > window:
+                c += 1
+            self._cursor[k] = c
+            v = 0.0
+            if history_s >= window and now > self._t[c]:
+                v = (mid - self._mid[c]) / (now - self._t[c])
+            pps.append(v)
+            scale = self.scales[k]
+            norms.append(math.tanh(v / scale) if scale else 0.0)
 
         # Volatility of ~step-scale moves; skip pairs spanning a rest/roll gap
         # (steps are ~1 s apart -- a > 5 s jump is not a market move).
-        pts = list(self._hist)
+        self._vol.append((now, mid))
+        while self._vol and now - self._vol[0][0] > self.VOL_WINDOW_S:
+            self._vol.popleft()
+        pts = list(self._vol)
         diffs = [b[1] - a[1] for a, b in zip(pts[:-1], pts[1:]) if b[0] - a[0] <= 5.0]
         vol = statistics.pstdev(diffs) if len(diffs) >= 2 else 0.0
 
         return {
-            "mid": snap.mid,
+            "mid": mid,
             "spread": snap.spread,
-            "momentum_pps": momentum_pps,
-            "momentum_norm": math.tanh(momentum_pps / self.cfg.momentum_scale) if self.cfg.momentum_scale else 0.0,
+            "momentum_pps": pps,
+            "momentum_norms": norms,
             "vol_points": vol,
         }
 

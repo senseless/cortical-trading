@@ -5,10 +5,18 @@
 name = "dev"
 label = "experiment"          # free-form tag, e.g. "control-random", "culture-A"
 mode = "agent"                # agent (motor regions + feedback) | reservoir (trained readout)
-episodes = 5
-steps_per_episode = 120       # env steps per episode (1 step ~= step_interval_s)
+# Episodes are sized to the instrument's cost structure: an /MBT round trip
+# costs ~90 points (spread + commissions), and the typical move only clears
+# that from roughly 5-30 minutes out, so positions must be holdable for tens
+# of minutes. 15-minute episodes are the shortest that let the culture express
+# a trade at the horizon where being right is worth money.
+episodes = 4
+steps_per_episode = 900       # env steps per episode (1 step ~= step_interval_s); 15 min at 1 Hz
 step_interval_s = 1.0         # seconds between action opportunities (~1 Hz per CL gridworld paper)
-rest_s = 90                   # rest/baseline period before and between episodes
+rest_s = 120                  # rest/baseline period before and between episodes
+warmup_s = 120                # pre-session rest: baseline collection + short-window top-up.
+                              # The strip's long windows are fed by pre-roll history
+                              # (source.preroll), not by this rest.
 baseline_interactions = 60    # baseline windows used for spike-count normalization
 loop_hz = 20                  # CL closed-loop tick rate (budget 50 ms per tick)
 accelerated = false           # true = decouple from wall clock (simulator only, non-live sources)
@@ -26,9 +34,13 @@ seed = 42
 start_price = 78000.0         # ~BTC level so synthetic runs share MBT-scaled parameters
 spread = 40.0                 # quoted spread in points (observed /MBT off-peak: 35-45)
 dt_s = 0.1                    # internal simulation resolution
-# signal parameters
-amplitude = 150.0             # sine amplitude (points)
-period_s = 120.0              # sine period
+# signal parameters. The sine is the learnability sanity check, so its signal
+# must live at the holding-period scale where trades clear costs: a 30-minute
+# period with trough-to-crest 800 points (~9x the round-trip cost). A 120 s
+# period is invisible to holding-period horizons -- at h = period/2 a perfectly
+# accurate predictor enters at the zero-capture phase and loses the spread.
+amplitude = 400.0             # sine amplitude (points)
+period_s = 1800.0             # sine period
 drift_per_s = 1.0             # trend drift (points/s)
 mean_revert_rate = 0.05       # OU reversion rate (1/s)
 noise_vol = 7.0               # noise sigma (points per sqrt(s)); ~BTC realized vol at seconds scale
@@ -65,18 +77,28 @@ sdk_seed = 42                 # CL_SDK_RANDOM_SEED for deterministic simulator r
 # CL1 hardware reserves 5 of the 64 channels: 0, 7, 56, 63 (unused grid
 # corners) and 4 (measurement reference). Never assign them — the simulator
 # accepts them but on real hardware those stims are silently dead.
+#
+# The momentum groups are chronotopic strips: channel order IS the timescale
+# axis (short -> long, matching neural.encoding.momentum_windows_s), so the
+# lists below must stay ordered and exactly as long as the window ladder.
+# Row 1 carries up-momentum, row 3 down-momentum, and row 2 is left empty as
+# a guard: blending is wanted *along* a strip (adjacent timescales are
+# correlated, so cross-talk generalizes) and destructive *across* valence.
 [neural.layout.sensory]
-momentum_up = [1, 2, 3, 5]    # column 1 of the 8x8 grid, skipping reserved 0 and 4
-momentum_down = [8, 9, 10, 11]
-position_long = [16, 17]
-position_flat = [24, 25]
-position_short = [32, 33]
-pnl_up = [20, 21]             # one row below position_long, gap limits cross-talk
-pnl_down = [28, 29]           # one row below position_flat
+momentum_up = [8, 9, 10, 11, 12, 13, 14, 15]      # row 1, full width: 30s -> 8h
+momentum_down = [24, 25, 26, 27, 28, 29, 30, 31]  # row 3, full width: 30s -> 8h
+position_long = [32, 33, 40, 41]   # rows 4-5 as 2x2 blocks with guard columns
+position_flat = [35, 36, 43, 44]   # (c2/c5 unassigned) so the states don't blend
+position_short = [38, 39, 46, 47]
+pnl_up = [1, 2]               # row 0, split across reserved channel 4
+pnl_down = [5, 6]
 
+# Motor on the bottom two rows, maximally far from the strips (three rows of
+# separation); symmetric 2x3 blocks so the buy/sell differential count is
+# unbiased. Cols 1-6 dodge the reserved corners 56/63.
 [neural.layout.motor]
-buy = [40, 41, 42, 43, 48, 49, 50, 51]
-sell = [44, 45, 46, 47, 52, 53, 54, 55]
+buy = [49, 50, 51, 57, 58, 59]
+sell = [52, 53, 54, 60, 61, 62]
 
 [neural.encoding]
 # Defaults follow Cortical Labs' large-scale optimization (arXiv:2605.13315)
@@ -86,8 +108,18 @@ amplitude_ua = 2.5
 pulse_width_us = 80.0
 position_rate_hz = 8.0        # fixed rate for the place-coded position group
 pnl_channel_enabled = true
-momentum_window_s = 30.0
-momentum_scale = 1.2          # points/s that saturates the momentum signal (~1 sigma of BTC 30s drift)
+# Chronotopic strip: one electrode per window, ordered short -> long. Must be
+# ascending and the same length as the momentum_up/down layout groups.
+# The ladder starts at 30 s because shorter moves can't clear /MBT round-trip
+# costs (~90 points), and tops out at 8 h where typical moves run ~4x costs.
+# The long windows are fed by pre-roll history at session start (replay: data
+# before start_offset_s; live: DXLink candle backfill; synthetic: generated),
+# so the whole strip is live from the first episode.
+momentum_windows_s = [30.0, 60.0, 300.0, 900.0, 1800.0, 3600.0, 14400.0, 28800.0]
+momentum_scale = 1.2          # points/s that saturates momentum AT momentum_scale_window_s
+momentum_scale_window_s = 30.0  # calibration window (~1 sigma of BTC 30s drift); other
+                              # windows scale as 1/sqrt(window), so every strip
+                              # channel spans the same 4-40 Hz range
 pnl_scale_points = 200.0      # unrealized PnL (points) that saturates the pnl signal ($20 on MBT)
 
 [neural.decoding]
@@ -98,9 +130,23 @@ readout_path = ""             # reservoir mode: path to trained readout bundle (
 readout_prob_threshold = 0.6  # reservoir mode: min probability to act
 
 [neural.reward]
+# hybrid (default): full feedback on trade close (net of costs) PLUS holding
+# feedback -- while a position is open, its unrealized PnL is evaluated every
+# holding_interval_s and, outside holding_deadband_points, earns mini
+# predictable (winner) or unpredictable (loser) stimulation. Culture credit
+# assignment is seconds-scale, so close-time-only feedback cannot shape entry
+# decisions across a 15-minute hold; the holding feedback makes the
+# contingency available at every moment -- and a losing position becomes an
+# aversive stimulus the culture can terminate at will by closing (closed-loop
+# stimulus removal, the best-replicated culture conditioning protocol).
+# per_tick (experimental arm): mini feedback on 1 s mark-to-market deltas.
 timing = "hybrid"             # per_tick | per_trade | hybrid
 shuffle = false               # true = control condition: valence resampled from past true outcomes (same rates, no contingency)
-deadband_points = 10.0        # per-tick MTM changes inside deadband get no feedback (~1s BTC noise)
+deadband_points = 10.0        # closed-trade net points (and per_tick deltas) inside this band get no feedback
+holding_interval_s = 20.0     # hybrid: evaluate the open position's unrealized PnL this often
+holding_deadband_points = 100.0  # ~the round-trip cost hurdle (spread + commissions ~90 pts): reward begins
+                              # once the trade has cleared its costs, punishment once it has lost more than
+                              # them; the scratch zone (including the entry's half-spread hole) is silence
 predictable_hz = 100.0
 predictable_burst_ms = 80.0
 predictable_bursts = 5        # full reward: N bursts spread over feedback window

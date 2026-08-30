@@ -56,7 +56,8 @@ class SessionRunner:
             self.decoder = AgentDecoder(cfg.neural.decoding, self.layout)
         self.baseline = BaselineTracker(list(self.layout.motor), cfg.session.baseline_interactions)
         self.reward = RewardGenerator(cfg.neural.reward, self.layout,
-                                      seed=cfg.neural.sdk_seed if cfg.neural.sdk_seed >= 0 else None)
+                                      seed=cfg.neural.sdk_seed if cfg.neural.sdk_seed >= 0 else None,
+                                      step_interval_s=cfg.session.step_interval_s)
 
         stamp = time.strftime("%Y%m%d_%H%M%S")
         self.out_dir = Path(cfg.session.output_dir) / f"{stamp}_{cfg.session.name}"
@@ -74,10 +75,15 @@ class SessionRunner:
         ticks_per_step = max(1, round(loop_hz * cfg.session.step_interval_s))
         rest_ticks = max(ticks_per_step, round(loop_hz * cfg.session.rest_s))
 
-        # Phase plan: rest before every episode.
+        # Phase plan: rest before every episode. The first rest is extended to
+        # warmup_s because the momentum strip's long windows are silent until
+        # that much market history exists -- rests feed the feature tracker
+        # (they just don't stimulate), so the pre-session rest warms the strip
+        # while it collects the spontaneous-activity baseline.
+        warmup_ticks = max(rest_ticks, round(loop_hz * cfg.session.warmup_s))
         phases: list[tuple[str, int, int]] = []  # (kind, episode_index, duration_ticks)
         for ep in range(cfg.session.episodes):
-            phases.append(("rest", ep, rest_ticks))
+            phases.append(("rest", ep, warmup_ticks if ep == 0 else rest_ticks))
             phases.append(("episode", ep, cfg.session.steps_per_episode * ticks_per_step))
 
         cl_mod = get_cl(cfg.neural, accelerated=cfg.session.accelerated)
@@ -94,6 +100,20 @@ class SessionRunner:
                 contract_desc = getattr(self.source, "contract_desc", "")
                 if contract_desc:
                     view.log(f"contract: {contract_desc}")
+                # Pre-roll: seed the feature tracker with history covering the
+                # ladder's longest window, so the whole strip is live from the
+                # first episode instead of taking hours to warm in-session.
+                longest_window = cfg.neural.encoding.momentum_windows_s[-1]
+                preroll_snaps = self.source.preroll(longest_window, cfg.session.step_interval_s)
+                covered = 0.0
+                if preroll_snaps:
+                    self.features.seed(preroll_snaps)
+                    covered = preroll_snaps[-1].t - preroll_snaps[0].t + cfg.session.step_interval_s
+                    view.log(f"preroll: {covered / 3600.0:.2f} h of history seeded the momentum strip")
+                if covered + warmup_ticks / loop_hz < longest_window:
+                    view.log(f"warning: preroll ({covered:.0f}s) + warm-up ({warmup_ticks / loop_hz:.0f}s) "
+                             f"cover less than the longest momentum window ({longest_window:g}s); the "
+                             "strip's long end will read silence until enough history accumulates")
                 with cl_mod.open() as neurons:
                     view.log(f"neurons: {backend_name(cl_mod)} | session -> {self.out_dir}")
                     recording = None
@@ -150,9 +170,19 @@ class SessionRunner:
                             boundary = tick_in_phase % ticks_per_step == 0
 
                             if kind == "rest" and boundary:
+                                self._drain_backfill(view)
                                 if self.source.pending_roll():
                                     self._handle_roll(neurons, stream, scheduler, i, episode,
                                                       i / loop_hz, view, log_fh)
+                                # Keep feeding the feature tracker through the
+                                # rest: the market moves while the culture
+                                # rests, and the momentum strip's long windows
+                                # need unbroken history to stay defined. No
+                                # stimulation is issued, so the baseline stays
+                                # spontaneous.
+                                rest_snap = self.source.snapshot(i / loop_hz)
+                                if rest_snap is not None:
+                                    self.features.update(rest_snap)
                                 # Baseline means *spontaneous* activity: skip any
                                 # window that overlapped stim playback (the
                                 # episode-end feedback tail plays into early rest
@@ -164,6 +194,7 @@ class SessionRunner:
                                 view.update(self._view_state(phase="rest", episode=episode, step=self.baseline.n_windows))
 
                             elif kind == "episode" and boundary:
+                                self._drain_backfill(view)
                                 if pause_ticks > 0:
                                     pause_ticks = max(0, pause_ticks - ticks_per_step)
                                     if pause_ticks == 0:
@@ -256,6 +287,13 @@ class SessionRunner:
         action, debug = self.decoder.decide(window_counts, self.baseline)
         return action, debug
 
+    def _drain_backfill(self, view) -> None:
+        """Seed history that arrived asynchronously (post-roll candle backfill)."""
+        snaps = self.source.take_preroll()
+        if snaps:
+            self.features.seed(snaps)
+            view.log(f"momentum strip re-seeded from {len(snaps)} backfilled candles")
+
     def _prime_episode(self, scheduler, now_tick: int, counts: np.ndarray) -> None:
         """Deliver the sensory stimulus for the current state (episode start / pause end)."""
         snap = self.source.snapshot(now_tick / self.cfg.session.loop_hz)
@@ -288,7 +326,10 @@ class SessionRunner:
 
         feedback = None
         if self.cfg.session.mode == "agent":
-            feedback = self.reward.evaluate(result)
+            # No holding mini on the final step: the episode-end flatten's full
+            # feedback is scheduled on this same tick, and stacking both trains
+            # (plus sensory) would breach the 200 Hz per-channel stim budget.
+            feedback = self.reward.evaluate(result, allow_holding=not final_step)
             if feedback:
                 scheduler.schedule(now_tick, feedback.commands)
                 if feedback.kind == "predictable":
@@ -308,7 +349,8 @@ class SessionRunner:
         row = dict(
             t=round(t_game, 3), wall_t=time.time(), episode=episode, step=step,
             mid=snap.mid, bid=snap.bid, ask=snap.ask,
-            momentum_norm=round(feats["momentum_norm"], 4), vol_points=round(feats["vol_points"], 4),
+            momentum_norms=[round(v, 4) for v in feats["momentum_norms"]],
+            vol_points=round(feats["vol_points"], 4),
             action=action.value, executed=result.executed, position=result.position,
             mtm_points=round(result.mtm_points, 4),
             unrealized_points=round(result.unrealized_points, 4),
@@ -327,7 +369,7 @@ class SessionRunner:
 
         view.update(self._view_state(
             phase="episode", episode=episode, step=step, mid=snap.mid,
-            momentum_norm=feats["momentum_norm"], action=action.value,
+            momentum_norms=feats["momentum_norms"], action=action.value,
             diff=debug.get("diff", 0.0) if isinstance(debug, dict) else 0.0,
             buy_count=debug.get("raw", {}).get("buy", 0) if isinstance(debug, dict) else 0,
             sell_count=debug.get("raw", {}).get("sell", 0) if isinstance(debug, dict) else 0,
@@ -364,7 +406,7 @@ class SessionRunner:
         self._log_row(log_fh, stream, neurons, dict(
             t=round(t_game, 3), wall_t=time.time(), episode=episode, step=-1,
             mid=snap.mid, bid=snap.bid, ask=snap.ask,
-            momentum_norm=0.0, vol_points=0.0,
+            momentum_norms=[], vol_points=0.0,
             action=label, executed=result.executed, position=result.position,
             mtm_points=round(result.mtm_points, 4),
             unrealized_points=0.0,

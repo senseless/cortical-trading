@@ -4,6 +4,7 @@ __pycache__/
 .env
 data/
 logs/
+paper/
 *.h5
 *.egg-info/
 .ipynb_checkpoints/

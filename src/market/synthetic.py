@@ -30,6 +30,7 @@ class SyntheticSource(MarketSource):
         self._t = 0.0
         self._noise = 0.0  # integrated brownian noise (points)
         self._ou = 0.0     # OU deviation for mean_revert (points)
+        self._t_offset = 0.0  # preroll shifts the session's origin along the path
 
     def describe(self) -> str:
         c = self.cfg
@@ -68,8 +69,33 @@ class SyntheticSource(MarketSource):
         # snr=4 (default) leaves the configured amplitude unchanged; snr=0 removes the signal.
         return c.start_price + self._signal(t) * (c.snr / 4.0) + self._noise
 
+    def preroll(self, duration_s: float, step_s: float = 1.0) -> list[MarketSnapshot]:
+        """Generate history by running the path for duration_s before t=0.
+
+        The session's origin shifts to the end of the pre-roll, so the game
+        sees one continuous path whose first duration_s seconds happened
+        "before" the session. Deterministic for a given seed, but note the
+        path at game time t differs from a no-preroll run (the RNG has
+        consumed the pre-roll steps).
+        """
+        if duration_s <= 0:
+            return []
+        if self._t > 0 or self._t_offset > 0:
+            raise RuntimeError("preroll must be called once, before the first snapshot")
+        half = self.cfg.spread / 2.0
+        snaps = []
+        for i in range(int(round(duration_s / step_s))):
+            ti = i * step_s
+            self._advance_to(ti)
+            mid = self._price(ti)
+            snaps.append(MarketSnapshot(t=ti - duration_s, bid=mid - half, ask=mid + half,
+                                        last=mid, bid_size=10, ask_size=10))
+        self._t_offset = duration_s
+        return snaps
+
     def snapshot(self, t: float) -> MarketSnapshot:
-        self._advance_to(t)
-        mid = self._price(t)
+        ti = t + self._t_offset
+        self._advance_to(ti)
+        mid = self._price(ti)
         half = self.cfg.spread / 2.0
         return MarketSnapshot(t=t, bid=mid - half, ask=mid + half, last=mid, bid_size=10, ask_size=10)

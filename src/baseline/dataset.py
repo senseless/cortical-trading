@@ -3,11 +3,14 @@
 Sources (recordings or synthetic regimes) are resampled onto a fixed step grid
 (the game cadence). Two feature sets are built:
 
-- "encoded": exactly the market signal the neurons receive today -- the
-  tanh-normalized momentum from FeatureTracker, computed with the same code
-  and config. One column.
-- "extended": candidate Phase-2 sensory channels -- returns over windows from
-  1 s to 4 h (fixed-scale and vol-normalized), short/long volatility ratio,
+- "encoded": exactly the market signal the neurons receive -- the
+  tanh-normalized momentum strip from FeatureTracker, computed with the same
+  code and config. One column per chronotopic window. Windows longer than the
+  history available so far read zero, exactly as the live encoder renders them
+  (silence), so short recordings still build a dataset with a partly dark
+  strip rather than being rejected outright.
+- "extended": candidate sensory channels -- returns over windows from
+  1 s to 8 h (fixed-scale and vol-normalized), short/long volatility ratio,
   spread in ticks, book imbalance, level proximity (position within the
   rolling 5-min/30-min range and range width in vol units), time of day.
   Windows longer than WARMUP_S report 0 until enough history accumulates
@@ -124,11 +127,11 @@ def synthetic_series(cfg: SyntheticCfg, steps: int, step_s: float = 1.0) -> list
 
 # ---------------------------------------------------------------------------
 
-# Day-trader momentum ladder: seconds for the game's current cadence, then
-# 5m/15m/30m/1h/4h where large directional moves actually develop.
+# Candidate momentum ladder: seconds for the game's cadence, then 5m through
+# 8h where moves grow large enough to clear round-trip costs.
 RETURN_WINDOWS_S = (1.0, 5.0, 15.0, 30.0, 60.0, 90.0, 120.0,
-                    300.0, 900.0, 1800.0, 3600.0, 14400.0)
-ZRET_WINDOWS_S = (5.0, 30.0, 120.0, 900.0, 3600.0, 14400.0)  # vol-normalized momentum (sigma units)
+                    300.0, 900.0, 1800.0, 3600.0, 14400.0, 28800.0)
+ZRET_WINDOWS_S = (5.0, 30.0, 120.0, 900.0, 3600.0, 14400.0, 28800.0)  # vol-normalized momentum (sigma units)
 LEVEL_WINDOWS_S = (300.0, 1800.0)       # near-term level structure windows
 VOL_SHORT_S = 30.0
 VOL_LONG_S = 300.0
@@ -178,8 +181,13 @@ def build_dataset(
 ) -> BaselineDataset:
     enc_cfg = cfg.neural.encoding
     tick = cfg.instrument.tick_size
-    warmup = int(max(WARMUP_S, enc_cfg.momentum_window_s) / step_s) + 1
+    # Warm-up covers the short end of the ladder; longer strip windows (like the
+    # long extended columns) zero-fill until their history exists rather than
+    # pushing the warmup out to the longest window and discarding whole
+    # recordings. Matches the live encoder's "zero = no information".
+    warmup = int(max(WARMUP_S, enc_cfg.momentum_windows_s[0]) / step_s) + 1
     max_h = int(max(horizons_s) / step_s)
+    strip_names = [f"mom_{w:g}s" for w in enc_cfg.momentum_windows_s]
 
     xs_enc, xs_ext, meta_rows, seg_ids = [], [], [], []
     labels: dict[float, list[np.ndarray]] = {h: [] for h in horizons_s}
@@ -189,13 +197,14 @@ def build_dataset(
         if n <= warmup + max_h:
             continue
 
-        # Encoded feature: identical computation to the live game.
+        # Encoded features: identical computation to the live game, one column
+        # per chronotopic strip window.
         tracker = FeatureTracker(enc_cfg)
-        momentum = np.empty(n)
+        momentum = np.empty((n, len(strip_names)))
         for i in range(n):
             snap = MarketSnapshot(t=float(seg.t[i]), bid=float(seg.bid[i]), ask=float(seg.ask[i]),
                                   last=float(seg.mid[i]))
-            momentum[i] = tracker.update(snap)["momentum_norm"]
+            momentum[i] = tracker.update(snap)["momentum_norms"]
 
         # Extended features, built by name so columns stay aligned with EXTENDED_NAMES.
         eps = 1e-9
@@ -204,16 +213,15 @@ def build_dataset(
         vol_l = _rolling_std(diffs, int(VOL_LONG_S / step_s))
         cols: dict[str, np.ndarray] = {}
 
-        # Multi-timescale momentum, fixed scale (matches the live encoder's
-        # units). Points-per-second shrinks with the window (~1/sqrt(w) for a
-        # diffusive price), so the hour-scale columns sit deep in tanh's linear
-        # region -- harmless here because both probes standardize on train
-        # stats, but a wetware encoding of these would need per-window scales.
+        # Multi-timescale momentum in the live encoder's units, each window on
+        # its own 1/sqrt(w) scale -- the same law the chronotopic strip uses,
+        # so a candidate column that shows signal here can be added to the
+        # strip without recalibration.
         for w_s in RETURN_WINDOWS_S:
             w = int(w_s / step_s)
             ret = np.zeros(n)
             ret[w:] = (seg.mid[w:] - seg.mid[:-w]) / (w * step_s)
-            cols[f"ret_{int(w_s)}s"] = np.tanh(ret / enc_cfg.momentum_scale)
+            cols[f"ret_{int(w_s)}s"] = np.tanh(ret / enc_cfg.scale_for_window(w_s))
 
         # Vol-normalized momentum: the same move in sigma units, so the signal
         # is comparable across volatility regimes (and across products).
@@ -250,7 +258,7 @@ def build_dataset(
         ext = np.column_stack([cols[name] for name in EXTENDED_NAMES])
 
         lo, hi = warmup, n - max_h
-        xs_enc.append(momentum[lo:hi, None])
+        xs_enc.append(momentum[lo:hi])
         xs_ext.append(ext[lo:hi])
         meta_rows.append(np.column_stack([seg.t[lo:hi], seg.bid[lo:hi], seg.ask[lo:hi], seg.mid[lo:hi]]))
         seg_ids.append(np.full(hi - lo, seg_id, dtype=np.int64))
@@ -268,7 +276,7 @@ def build_dataset(
     ds = BaselineDataset(
         step_s=step_s,
         horizons_s=list(horizons_s),
-        feature_names={"encoded": ["momentum_norm"], "extended": list(EXTENDED_NAMES)},
+        feature_names={"encoded": strip_names, "extended": list(EXTENDED_NAMES)},
         X={"encoded": np.vstack(xs_enc), "extended": np.vstack(xs_ext)},
         t=meta[:, 0], bid=meta[:, 1], ask=meta[:, 2], mid=meta[:, 3],
         segment_id=np.concatenate(seg_ids),

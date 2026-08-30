@@ -6,9 +6,14 @@ Usage:
     python train_baseline.py --data synthetic:random_walk     # unlearnable control (should FAIL: no leakage)
     python train_baseline.py --data data/market/<recording>.jsonl.gz
     python train_baseline.py --data <file1> --data <file2>    # multiple recordings
-    python train_baseline.py --horizons 5,15,30,60 --band 0.1
-    python train_baseline.py --horizons 60,300,900,3600 ...   # day-trader horizons; needs
-                                                              # correspondingly long recordings
+    python train_baseline.py --horizons 5,15,30,60 ...        # seconds-scale horizons (diagnostics only:
+                                                              # /MBT moves at these horizons cannot clear costs)
+
+Label horizons default to holding-period scale (1m-1h): an /MBT round trip
+costs ~90 points (spread + commissions) and the typical move only reaches
+that from ~5-30 minutes out, so predictability at shorter horizons is not
+tradeable even when real. Long horizons need correspondingly long recordings
+(the effective test count shrinks by horizon/step due to label overlap).
 
 Interpretation: if no model beats the majority-class share (outside the
 binomial CI) on real data at any horizon, the current encoding carries no
@@ -40,10 +45,13 @@ def main() -> None:
     parser.add_argument("--data", action="append", default=None,
                         help="'synthetic:<regime>' or path to a recording; repeatable (default synthetic:sine)")
     parser.add_argument("--config", default="config/default.toml")
-    parser.add_argument("--steps", type=int, default=20000, help="samples for synthetic data")
+    parser.add_argument("--steps", type=int, default=50000,
+                        help="samples for synthetic data (~14 h at 1 s; hour-scale label "
+                             "horizons need room for the split-boundary purge)")
     parser.add_argument("--snr", type=float, default=None, help="synthetic snr override")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--horizons", default="5,15,30,60", help="label horizons in seconds")
+    parser.add_argument("--horizons", default="60,300,900,3600",
+                        help="label horizons in seconds (default: holding-period scale, 1m-1h)")
     parser.add_argument("--step-interval", type=float, default=1.0, help="grid/game cadence seconds")
     parser.add_argument("--min-move", type=float, default=0.0, help="drop labels with |move| <= this (points)")
     parser.add_argument("--band", type=float, default=0.1, help="hold band: act when p outside 0.5 +/- band")

@@ -72,6 +72,9 @@ when embodied in a simulated game-world":
   `wss://tasty-openapi-ws.dxfeed.com/realtime`, open FEED channel, subscribe.
 - Event types: `Quote` (bid/ask + sizes), `Trade` (prints), `Candle`
   (e.g. `/MNQZ26:XCME{=1s}` or `{=5m}`, historical backfill via `fromTime`).
+  Candle backfill is what feeds the momentum strip's pre-roll on live sessions
+  (`LiveSource.preroll`, 1m candles over the ladder's longest window) and the
+  post-roll strip re-seed.
 - Futures streamer symbols: `/MNQZ26:XCME` style (product + month code + `:XCME`).
 - Real-time CME data comes with a funded tastytrade account (needs futures approval,
   "The Works" trading level for futures).
@@ -183,7 +186,10 @@ signals → 3 actions: buy/sell/hold).
 - Feedback: reward > 0 → five structured 100 Hz bursts (80 ms) across BOTH
   encoding and decoding regions; reward ≤ 0 → random stimulation. Reward was
   graded (+2 goal, −0.2 collision, continuous shaping on odor change) →
-  supports a hybrid reward: small continuous MTM shaping + big per-trade events.
+  supports a hybrid reward: recurring holding-level feedback while a position
+  is open (unrealized PnL vs a cost-scale deadband, ~20 s cadence — the losing
+  case is stimulus-removal conditioning à la Shahaf & Marom) + big per-trade
+  events at close.
 - **Episodic structure beats continuous**: 5 × 30-step episodes with 2-minute
   rests significantly outperformed one 150-step run. Design trading sessions as
   short episodes with rest breaks, not marathon sessions.

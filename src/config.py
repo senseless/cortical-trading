@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import tomllib
 from dataclasses import dataclass, field
@@ -16,11 +17,18 @@ class SessionCfg:
     name: str = "dev"
     label: str = "experiment"
     mode: str = "agent"
-    episodes: int = 5
-    steps_per_episode: int = 120
+    # Episode length follows the cost structure: /MBT moves only clear the
+    # ~90-point round-trip cost from ~5-30 minutes out, so episodes must be
+    # long enough to hold a position at that horizon.
+    episodes: int = 4
+    steps_per_episode: int = 900
     step_interval_s: float = 1.0
-    rest_s: float = 90.0
+    rest_s: float = 120.0
     baseline_interactions: int = 60
+    # Pre-session rest: baseline collection plus a short-window top-up. The
+    # momentum strip's long windows are fed by pre-roll history
+    # (MarketSource.preroll) at session start, not by this rest.
+    warmup_s: float = 120.0
     loop_hz: int = 20
     accelerated: bool = False
     score_metric: str = "pnl_after_costs"
@@ -36,8 +44,10 @@ class SyntheticCfg:
     start_price: float = 78000.0
     spread: float = 40.0
     dt_s: float = 0.1
-    amplitude: float = 150.0
-    period_s: float = 120.0
+    # Sine at holding-period scale (trough-to-crest ~9x round-trip costs):
+    # the sanity check must be winnable at the horizons the game trades.
+    amplitude: float = 400.0
+    period_s: float = 1800.0
     drift_per_s: float = 1.0
     mean_revert_rate: float = 0.05
     noise_vol: float = 7.0
@@ -90,9 +100,32 @@ class EncodingCfg:
     pulse_width_us: float = 80.0
     position_rate_hz: float = 8.0
     pnl_channel_enabled: bool = True
-    momentum_window_s: float = 30.0
+    # Chronotopic momentum strip: one window per electrode along the strip,
+    # ordered short -> long. Ascending order is the topography, so the k-th
+    # window is delivered on the k-th channel of the momentum_up/down group.
+    # 30 s .. 8 h: the short bound is where /MBT moves start to be comparable
+    # to round-trip costs; long windows are fed by pre-roll history.
+    momentum_windows_s: list[float] = field(
+        default_factory=lambda: [30.0, 60.0, 300.0, 900.0, 1800.0, 3600.0, 14400.0, 28800.0])
     momentum_scale: float = 1.2
+    momentum_scale_window_s: float = 30.0
     pnl_scale_points: float = 200.0
+
+    def scale_for_window(self, window_s: float) -> float:
+        """Points-per-second that saturates the signal for a given window.
+
+        Momentum is a velocity, and for a diffusive price the move over a
+        window grows like sqrt(window), so velocity shrinks like
+        1/sqrt(window). A single scale calibrated at momentum_scale_window_s
+        would therefore saturate the short windows and leave the long ones
+        pinned near zero; each window gets its own scale under that law so
+        every strip channel spans the same 4-40 Hz range.
+        """
+        return self.momentum_scale * math.sqrt(self.momentum_scale_window_s / window_s)
+
+    @property
+    def momentum_scales(self) -> list[float]:
+        return [self.scale_for_window(w) for w in self.momentum_windows_s]
 
 
 @dataclass
@@ -109,6 +142,14 @@ class RewardCfg:
     timing: str = "hybrid"
     shuffle: bool = False
     deadband_points: float = 10.0
+    # Hybrid holding feedback: while a position is open, its unrealized PnL
+    # level is evaluated every holding_interval_s; outside the deadband the
+    # culture gets mini predictable/unpredictable feedback. The deadband sits
+    # at ~the round-trip cost hurdle so a fresh entry (which starts half a
+    # spread underwater by construction) is not punished for existing, and
+    # reward only begins once the trade has actually cleared its costs.
+    holding_interval_s: float = 20.0
+    holding_deadband_points: float = 100.0
     predictable_hz: float = 100.0
     predictable_burst_ms: float = 80.0
     predictable_bursts: int = 5
@@ -163,6 +204,28 @@ class Config:
                 raise ValueError(
                     f"layout assigns CL1 reserved channels {sorted(reserved)} "
                     "(0, 7, 56, 63 = unused corners; 4 = reference channel)")
+        # Chronotopic strip: the window ladder defines the topography, and the
+        # k-th window is delivered on the k-th channel of each strip. A ladder
+        # that is unordered, or a strip whose length disagrees with it, would
+        # silently scramble the timescale axis or drop its long end.
+        windows = self.neural.encoding.momentum_windows_s
+        if not windows:
+            raise ValueError("neural.encoding.momentum_windows_s must list at least one window")
+        if any(w <= 0 for w in windows):
+            raise ValueError("neural.encoding.momentum_windows_s must be positive")
+        if list(windows) != sorted(windows) or len(set(windows)) != len(windows):
+            raise ValueError(
+                f"neural.encoding.momentum_windows_s = {windows} must be strictly "
+                "ascending: the order along the strip *is* the timescale axis")
+        if self.neural.encoding.momentum_scale_window_s <= 0:
+            raise ValueError("neural.encoding.momentum_scale_window_s must be > 0")
+        for group in ("momentum_up", "momentum_down"):
+            chans = self.neural.sensory.get(group)
+            if chans is not None and len(chans) != len(windows):
+                raise ValueError(
+                    f"neural.layout.sensory.{group} has {len(chans)} channels but "
+                    f"momentum_windows_s has {len(windows)} windows; the strip needs "
+                    "exactly one electrode per window, ordered short -> long")
         # CL1 hard limit: max 200 Hz stimulation per channel (cell protection).
         for name, hz in (("neural.encoding.f_max_hz", self.neural.encoding.f_max_hz),
                          ("neural.reward.predictable_hz", self.neural.reward.predictable_hz)):
@@ -173,6 +236,15 @@ class Config:
         # play concurrently on the same channels -- instantaneously over the
         # 200 Hz limit even though each train alone passes the checks above.
         r = self.neural.reward
+        # A typo here would not error anywhere downstream -- evaluate() simply
+        # matches no branch and the session runs with NO feedback at all.
+        if r.timing not in ("per_tick", "per_trade", "hybrid"):
+            raise ValueError(f"unknown neural.reward.timing: {r.timing!r} "
+                             "(expected per_tick, per_trade, or hybrid)")
+        if r.holding_interval_s <= 0:
+            raise ValueError("neural.reward.holding_interval_s must be > 0")
+        if r.holding_deadband_points < 0:
+            raise ValueError("neural.reward.holding_deadband_points must be >= 0")
         if r.predictable_bursts < 1:
             raise ValueError("neural.reward.predictable_bursts must be >= 1")
         if r.predictable_bursts > 1:
@@ -198,6 +270,11 @@ class Config:
                              "(PnL and net-points feedback divide by them)")
         if self.session.score_metric not in ("pnl_after_costs", "directional_accuracy"):
             raise ValueError(f"unknown session.score_metric: {self.session.score_metric!r}")
+        if self.neural.decoding.normalization not in ("ratio", "zscore"):
+            # The decoder falls back to ratio for anything != "zscore", so a
+            # typo would silently run a different normalization than written.
+            raise ValueError(f"unknown neural.decoding.normalization: "
+                             f"{self.neural.decoding.normalization!r} (expected ratio or zscore)")
         if self.neural.decoding.min_baseline_count <= 0:
             raise ValueError("neural.decoding.min_baseline_count must be > 0 "
                              "(it floors the normalization denominator)")
@@ -210,6 +287,8 @@ class Config:
                              "(they define the closed-loop clock)")
         if self.session.rest_s < 0 or self.session.baseline_interactions <= 0:
             raise ValueError("session.rest_s must be >= 0 and baseline_interactions > 0")
+        if self.session.warmup_s < 0:
+            raise ValueError("session.warmup_s must be >= 0")
         if self.session.mode not in ("agent", "reservoir"):
             raise ValueError(f"unknown session mode: {self.session.mode}")
         if self.market.source not in ("synthetic", "replay", "live"):

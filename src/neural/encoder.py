@@ -2,10 +2,17 @@
 
 Mirrors the DishBrain/gridworld encoding scheme: which electrode group fires
 carries the signal's identity and sign (place coding); stimulation frequency
-between f_min and f_max carries magnitude (rate coding). Deliberately minimal
-sensory channels for Phase 1 -- momentum, position state, unrealized PnL --
-each claiming its own electrode groups from the layout. Groups absent from the
-layout are skipped, so channels can be enabled/disabled purely via config.
+between f_min and f_max carries magnitude (rate coding). Sensory channels are
+momentum, position state, and unrealized PnL, each claiming its own electrode
+groups from the layout. Groups absent from the layout are skipped, so channels
+can be enabled/disabled purely via config.
+
+Momentum is delivered on two chronotopic strips (one per direction): the k-th
+configured window is stimulated on the k-th channel of the strip, so timescale
+is a spatial axis ordered short -> long. Different windows can disagree in
+sign, and that is the point -- a short-term pullback inside a longer uptrend
+lights the down strip's short end and the up strip's long end at the same
+time, a pattern a single-window encoding cannot represent.
 """
 
 from __future__ import annotations
@@ -37,19 +44,27 @@ class Encoder:
             tag=f"sensory:{tag}",
         )
 
-    def encode_step(self, features: dict[str, float], position: int,
+    def encode_step(self, features: dict, position: int,
                     unrealized_points: float) -> list[StimCommand]:
         cmds: list[StimCommand] = []
         lay = self.layout
 
-        # 1. Momentum: sign -> group (place), magnitude -> rate. Exactly zero
-        # (warm-up, or no move) is silence, not a weak "up" -- stimulating the
-        # up group at f_min for unknown momentum would bake in a long bias.
-        v = features.get("momentum_norm", 0.0)
-        if v != 0.0:
+        # 1. Momentum strips: sign -> which strip (place), window index -> which
+        # electrode along it (place), magnitude -> rate. Exactly zero (warm-up,
+        # or no move) is silence, not a weak "up" -- stimulating at f_min for
+        # unknown momentum would bake in a directional bias, and it is silence
+        # that lets the strip's long end stay dark until it has history.
+        for k, v in enumerate(features.get("momentum_norms", ())):
+            if v == 0.0:
+                continue
             group = "momentum_up" if v > 0 else "momentum_down"
-            if lay.has(group):
-                cmds.append(self._burst(lay.group(group), self._rate(v), f"momentum{'+' if v > 0 else '-'}"))
+            if not lay.has(group):
+                continue
+            channels = lay.group(group)
+            if k >= len(channels):
+                continue  # strip shorter than the ladder (config validation rejects this)
+            cmds.append(self._burst([channels[k]], self._rate(v),
+                                    f"momentum{'+' if v > 0 else '-'}[{self.cfg.momentum_windows_s[k]:g}s]"))
 
         # 2. Position state: pure place coding at a fixed rate (the neurons feel their paddle).
         pos_group = {1: "position_long", 0: "position_flat", -1: "position_short"}[int(position)]

@@ -12,6 +12,17 @@ _QUICK_EDIT = 0x0040
 _EXTENDED_FLAGS = 0x0080
 
 
+def _strip(norms) -> str:
+    """Render the chronotopic momentum strip, short window first.
+
+    A dot marks a window that has no reading yet (not enough history), which
+    is what the culture receives too: silence, not a weak signal.
+    """
+    if not norms:
+        return "-"
+    return " ".join("  .  " if v == 0.0 else f"{v:+.2f}" for v in norms)
+
+
 def _set_quickedit(enabled: bool) -> int | None:
     """Windows only: toggle console QuickEdit mode. Returns the prior mode.
 
@@ -69,7 +80,8 @@ class ConsoleView:
         table.add_column("v")
         rows = [
             ("phase", f"{s.get('phase', '-')}  ep {s.get('episode', '-')} step {s.get('step', '-')}"),
-            ("market", f"{s.get('mid', float('nan')):.2f}  (mom {s.get('momentum_norm', 0.0):+.2f})"),
+            ("market", f"{s.get('mid', float('nan')):.2f}"),
+            ("momentum strip", _strip(s.get("momentum_norms"))),
             ("position", f"{s.get('position', 0):+d}  unrealized {s.get('unrealized_points', 0.0):+.2f} pts"),
             ("realized", f"${s.get('realized_dollars', 0.0):+.2f}  ({s.get('n_trades', 0)} trades)"),
             ("last action", f"{s.get('action', '-')}   diff {s.get('diff', 0.0):+.3f}"),

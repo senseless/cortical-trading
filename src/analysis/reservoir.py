@@ -66,14 +66,18 @@ def _session_start_wall_t(session_dir: str | Path) -> float:
 def _session_layout(session_dir: str | Path) -> dict | None:
     """Electrode layout a session ran with, from its archived config.
 
-    Channel lists are sorted so the fingerprint compares by *content*: the
-    same electrodes written in a different order are the same layout.
+    Sensory channel order is preserved: the momentum strips are topographic,
+    so the same electrodes in a different order are a *different* layout
+    (the timescale axis is scrambled). Motor lists are sorted -- decoding
+    only sums their counts, so order carries no meaning there. This mirrors
+    ReservoirDecoder's comparison exactly; sorting the sensory lists here
+    would erase the very information that check depends on.
     """
     path = Path(session_dir) / "config_used.json"
     if not path.exists():
         return None
     neural = json.loads(path.read_text(encoding="utf-8")).get("neural", {})
-    return {"sensory": {k: sorted(v) for k, v in neural.get("sensory", {}).items()},
+    return {"sensory": {k: list(v) for k, v in neural.get("sensory", {}).items()},
             "motor": {k: sorted(v) for k, v in neural.get("motor", {}).items()}}
 
 

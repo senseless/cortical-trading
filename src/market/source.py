@@ -55,6 +55,22 @@ class MarketSource:
     def snapshot(self, t: float) -> MarketSnapshot | None:
         raise NotImplementedError
 
+    def preroll(self, duration_s: float, step_s: float = 1.0) -> list[MarketSnapshot]:
+        """Historical snapshots covering the duration before the session start.
+
+        Called once after start(), before the closed loop begins, so the
+        momentum strip's long windows have history from the first step.
+        Snapshots are ordered oldest-first with timestamps on the same axis
+        snapshot() uses (negative game time for synthetic/replay, epoch
+        seconds for live). Sources without history return [] -- the strip's
+        long end then stays dark until in-session history accumulates.
+        """
+        return []
+
+    def take_preroll(self) -> list[MarketSnapshot]:
+        """Drain history that became available mid-session (post-roll backfill)."""
+        return []
+
     def pending_roll(self) -> PendingRoll | None:
         """Non-live sources never roll."""
         return None

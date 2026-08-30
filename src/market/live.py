@@ -32,6 +32,7 @@ import math
 import threading
 import time
 import traceback
+from datetime import datetime, timezone
 
 from ..config import LiveCfg
 from .recorder import MarketRecorder, default_recording_path
@@ -77,6 +78,8 @@ class LiveSource(MarketSource):
         self._thread: threading.Thread | None = None
         self._streamer = None
         self._Quote = self._Trade = None
+        self._preroll_duration_s = 0.0         # remembered for post-roll backfill
+        self._pending_preroll: list[MarketSnapshot] = []  # under _lock
 
     def describe(self) -> str:
         return f"live:{self.symbol or self.cfg.product_code}"
@@ -169,6 +172,96 @@ class LiveSource(MarketSource):
         desc = (f"{contract.symbol} ({contract.streamer_symbol}) "
                 f"stops trading {contract.expiration_date} ({days_left:.1f}d)")
         return f"{desc} | {note}" if note else desc
+
+    # -- historical backfill ---------------------------------------------------
+
+    CANDLE_INTERVAL = "1m"          # preroll resolution; the strip's shortest window is 30 s,
+                                    # but preroll only needs to anchor the minutes-to-hours end
+    CANDLE_SILENCE_S = 3.0          # no candle for this long = history dump complete
+    CANDLE_FETCH_TIMEOUT_S = 45.0
+
+    def preroll(self, duration_s: float, step_s: float = 1.0) -> list[MarketSnapshot]:
+        """Backfill history via DXLink candles so the strip starts warm.
+
+        Blocks the caller (runner startup, before the closed loop) while the
+        stream thread fetches. Failure is soft: the session starts with a
+        cold long end rather than not at all.
+        """
+        self._preroll_duration_s = duration_s
+        if duration_s <= 0 or not self._loop or self._loop.is_closed():
+            return []
+        fut = asyncio.run_coroutine_threadsafe(
+            self._fetch_history(self.symbol, duration_s), self._loop)
+        try:
+            return fut.result(timeout=self.CANDLE_FETCH_TIMEOUT_S)
+        except Exception as exc:
+            log.warning("candle backfill failed (%s); the strip's long windows "
+                        "stay dark until live history accumulates", exc)
+            return []
+
+    def take_preroll(self) -> list[MarketSnapshot]:
+        with self._lock:
+            snaps, self._pending_preroll = self._pending_preroll, []
+        return snaps
+
+    async def _fetch_history(self, symbol: str, duration_s: float) -> list[MarketSnapshot]:
+        """Subscribe to 1m candles with a from-time, drain the history dump.
+
+        dxFeed replays the requested range as a burst of Candle events, then
+        keeps streaming the live candle; a few seconds of silence marks the
+        end of the burst. Candle closes become bid=ask=mid snapshots stamped
+        with the candle's epoch time -- the momentum strip only needs mids.
+        """
+        from tastytrade.dxfeed import Candle
+
+        cutoff = time.time() - duration_s
+        start = datetime.fromtimestamp(cutoff - 120.0, tz=timezone.utc)
+        await self._streamer.subscribe_candle([symbol], self.CANDLE_INTERVAL, start_time=start)
+        closes: dict[float, float] = {}
+        gen = self._streamer.listen(Candle)
+        deadline = self._loop.time() + self.CANDLE_FETCH_TIMEOUT_S - 5.0
+        try:
+            while True:
+                remaining = deadline - self._loop.time()
+                if remaining <= 0:
+                    break
+                try:
+                    c = await asyncio.wait_for(
+                        gen.__anext__(), timeout=min(self.CANDLE_SILENCE_S, remaining))
+                except asyncio.TimeoutError:
+                    break
+                if c.event_symbol.split("{")[0] != symbol:
+                    continue  # candle from a contract we rolled away from
+                close = _f(c.close)
+                if not math.isnan(close):
+                    closes[c.time / 1000.0] = close  # dxFeed times are epoch ms
+        finally:
+            try:
+                await gen.aclose()
+            except Exception:
+                pass
+            try:
+                await self._streamer.unsubscribe_candle(symbol, self.CANDLE_INTERVAL)
+            except Exception:
+                pass  # backfill is best-effort; never poison the stream for it
+        return [MarketSnapshot(t=t, bid=px, ask=px, last=px)
+                for t, px in sorted(closes.items()) if t >= cutoff]
+
+    async def _backfill_after_roll(self) -> None:
+        """Refill the strip's history with the new contract's candles.
+
+        Runs as its own task after the roll switch completes, so the roll
+        itself stays fast; the runner drains take_preroll() at the next
+        boundary and seeds the (already reset) feature tracker.
+        """
+        try:
+            snaps = await self._fetch_history(self.symbol, self._preroll_duration_s)
+        except Exception as exc:
+            log.warning("post-roll candle backfill failed (%s); the strip "
+                        "rebuilds from live data", exc)
+            return
+        with self._lock:
+            self._pending_preroll = snaps
 
     # -- contract rolls --------------------------------------------------------
 
@@ -266,6 +359,10 @@ class LiveSource(MarketSource):
             self._skip_snapshot_quote = self._skip_snapshot_trade = True
             await self._streamer.subscribe(self._Quote, [self.symbol])
             await self._streamer.subscribe(self._Trade, [self.symbol])
+            if self._preroll_duration_s > 0:
+                # Detached on purpose: the strip refill takes seconds of
+                # network time and must not extend the roll's data outage.
+                asyncio.get_running_loop().create_task(self._backfill_after_roll())
         except BaseException as exc:
             self._error = exc
             self._error_tb = traceback.format_exc()
