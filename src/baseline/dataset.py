@@ -11,8 +11,11 @@ Sources (recordings or synthetic regimes) are resampled onto a fixed step grid
   strip rather than being rejected outright.
 - "extended": candidate sensory channels -- returns over windows from
   1 s to 8 h (fixed-scale and vol-normalized), short/long volatility ratio,
-  spread in ticks, book imbalance, level proximity (position within the
-  rolling 5-min/30-min range and range width in vol units), time of day.
+  spread in ticks, book imbalance (instantaneous and smoothed over several
+  windows -- top-of-book size on micros is a few contracts, so the moment's
+  ratio is mostly noise; the documented signal is the time average), level
+  proximity (position within the rolling 5-min/30-min range and range width
+  in vol units), time of day.
   Windows longer than WARMUP_S report 0 until enough history accumulates
   within the segment -- the live encoder's "zero = no information" semantics
   -- so short recordings still build a dataset; the long-window columns just
@@ -133,6 +136,7 @@ RETURN_WINDOWS_S = (1.0, 5.0, 15.0, 30.0, 60.0, 90.0, 120.0,
                     300.0, 900.0, 1800.0, 3600.0, 14400.0, 28800.0)
 ZRET_WINDOWS_S = (5.0, 30.0, 120.0, 900.0, 3600.0, 14400.0, 28800.0)  # vol-normalized momentum (sigma units)
 LEVEL_WINDOWS_S = (300.0, 1800.0)       # near-term level structure windows
+IMB_WINDOWS_S = (5.0, 30.0, 120.0)      # book-imbalance smoothing windows
 VOL_SHORT_S = 30.0
 VOL_LONG_S = 300.0
 # Rows discarded at each segment start so every window at or below this is
@@ -144,6 +148,7 @@ EXTENDED_NAMES = (
     [f"ret_{int(w)}s" for w in RETURN_WINDOWS_S]
     + [f"zret_{int(w)}s" for w in ZRET_WINDOWS_S]
     + ["vol_ratio", "spread_ticks", "book_imbalance"]
+    + [f"imb_{int(w)}s" for w in IMB_WINDOWS_S]
     + [f"range_pos_{int(w)}s" for w in LEVEL_WINDOWS_S]
     + ["range_width", "tod_sin", "tod_cos"]
 )
@@ -236,6 +241,12 @@ def build_dataset(
         size_sum = seg.bid_size + seg.ask_size
         with np.errstate(invalid="ignore", divide="ignore"):
             cols["book_imbalance"] = np.where(size_sum > 0, (seg.bid_size - seg.ask_size) / size_sum, 0.0)
+        # Smoothed imbalance: the per-moment ratio flips with every one-lot
+        # order on a thin micro book; persistent one-sided pressure over
+        # seconds-to-minutes is the version with predictive evidence behind
+        # it -- and the version a sensory channel would encode.
+        for w_s in IMB_WINDOWS_S:
+            cols[f"imb_{int(w_s)}s"] = _rolling_mean(cols["book_imbalance"], int(w_s / step_s))
 
         # Near-term level structure: where price sits within the rolling range
         # (0 = at the low, 1 = at the high; the stochastic-%K idea) and how
@@ -300,6 +311,16 @@ def build_dataset(
                 "total); use a longer recording or shorter/fewer horizons")
         ds.splits[name] = mask
     return ds
+
+
+def _rolling_mean(x: np.ndarray, w: int) -> np.ndarray:
+    """Rolling mean, partial windows from the start (vectorized)."""
+    n = len(x)
+    i = np.arange(n)
+    j = np.maximum(0, i - w + 1)
+    cnt = (i - j + 1).astype(np.float64)
+    cm = np.cumsum(x)
+    return (cm - np.where(j > 0, cm[j - 1], 0.0)) / cnt
 
 
 def _rolling_std(x: np.ndarray, w: int) -> np.ndarray:
