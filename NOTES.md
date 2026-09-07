@@ -24,11 +24,30 @@ first, go live only after demonstrated edge.
 - `neurons.loop(ticks_per_second=N)` — closed-loop driver, up to 25 kHz. Each tick
   exposes `tick.analysis.spikes` (list of `Spike(timestamp, channel)`) and
   `tick.analysis.stims`. Hard real-time: exceeding tick budget raises `TimeoutError`
-  (use `recover_from_jitter()` or lower tick rates).
+  (on hardware; the 1.0.0 simulator only warns). Two escape hatches:
+  `tick.loop.recover_from_jitter(callback, timeout)` skips ticks until the loop
+  catches up after a *known* long operation (skipped ticks' spikes only reach the
+  callback), and `neurons.loop(..., jitter_tolerance_frames=N)` lets the loop run
+  up to N frames late without raising. The runner has no long operations inside a
+  tick (rolls are non-blocking), so it uses the latter, from
+  `session.jitter_tolerance_ticks` (default 2 ticks): an OS hiccup delivers ticks
+  late instead of ending a rented session. Stims serialize per channel (a stim
+  issued on a busy channel waits, it never stacks), so overlapping trains get
+  delayed, not rate-limited.
 - Stimulation: `neurons.stim(ChannelSet, StimDesign, BurstDesign)`.
   - `StimDesign(width_us, current_uA, ...)` mono/bi/tri-phasic pulses, widths in
     multiples of 20 µs, negative leading edge recommended.
-  - `BurstDesign(count, hz)` for repeated stims.
+  - `BurstDesign(count, hz)` for repeated stims. A burst reserves its channel
+    for `count/hz` seconds (the interval *after* the last pulse counts), so a
+    train meant to fill a 1 s step must use `floor(hz * 1 s)` pulses;
+    `round()` overruns the step whenever it rounds up and the overrun
+    compounds every step (measured in the simulator: +87 ms/step at 4.6 Hz).
+  - A multi-channel `stim()` is preceded by an implicit sync: it starts on
+    every channel at the *latest* free time among them. One lagging channel
+    therefore delays a whole-sensory-area feedback burst, and every channel
+    in the set inherits that lag afterwards.
+  - Commands issued from the loop body are stamped with the end of the tick's
+    frame window, i.e. they start one tick after the iteration that issued them.
   - **Hard limit: max 200 Hz stim per channel** (cell protection).
 - `neurons.create_data_stream(name, attributes)` — log arbitrary game state
   (e.g. price, position, PnL) time-aligned with spikes into the HDF5 recording.
@@ -98,8 +117,13 @@ when embodied in a simulated game-world":
 
 True HFT (µs–ms) is not achievable here and shouldn't be the goal:
 - Retail websocket data: ~50–300 ms behind the matching engine.
-- Cortical Cloud instances live in Melbourne — market data must travel there.
+- Cortical Cloud instances live in Melbourne — market data must travel there (the
+  design in README/`src/` keeps the closed loop local to the market feed and treats
+  the CL device as the remote end; either way one leg crosses an ocean).
 - Tastytrade order round-trip: ~100+ ms, plus no colocation.
+- The DXLink quote token is valid 24 h and cached per account, so every stream
+  drops once a day at the same minute; the live source and the library recorder
+  both reconnect (see README "Live stream lifetime").
 
 What IS fast: the neurons' internal decision loop (10 ms bins, like Pong). So the
 realistic shape is **high-frequency decisions, human-scale execution**: game ticks
@@ -123,7 +147,10 @@ instrument: **short (-1), flat (0), long (+1)**, one contract.
     (place) + magnitude → stim rate (4–40 Hz analog).
   - Current position state (long/flat/short) on a dedicated electrode group —
     the neurons should "feel" their own position, like feeling the paddle.
-  - Optionally: unrealized PnL direction as a third channel group.
+  - Unrealized PnL direction as a third channel group.
+  - Book imbalance (bid-heavy vs ask-heavy top of book, 30 s mean) as a fourth:
+    the one non-price input, who is queued rather than what has traded. Built
+    as `imbalance_bid` / `imbalance_ask` in the layout (README "Electrode layout").
 - **Motor output**: two motor regions, spike counts per bin:
   - Region 1 wins → move position toward +1 (buy: open long / close short).
   - Region 2 wins → move position toward -1 (sell: open short / close long).
@@ -153,14 +180,16 @@ shuffled-feedback control).
 2. **Phase 1 — pipeline on simulator (free, local)**: DXLink client, game engine,
    encoder/decoder, sim broker, session recorder/metrics — all against `cl-sdk`.
    This is 90% of the code and costs nothing.
-3. **Phase 2 — real neurons, paper trading**: deploy to Cortical Cloud, run
+3. **Phase 2 — real neurons, paper trading**: point the same runner at a rented CL1
+   on Cortical Cloud (the code stays a local proxy, see README), run
    training sessions, compare vs. random/control baselines. Iterate on encoding
    and reward design (this is where the real experimentation happens).
 4. **Phase 3 — evaluation gate**: predefined metrics (win rate, PnL after costs,
    consistency across sessions/cultures) that must beat controls before any live
    trading.
-5. **Phase 4 — live**: micro contract (/MES or /MNQ), max position 1, daily loss
-   limit, kill switch, same code path with live broker adapter.
+5. **Phase 4 — live**: micro contract (/MBT as built; /MES or /MNQ were the early
+   candidates), max position 1, daily loss limit, kill switch, same code path with
+   live broker adapter.
 
 ## 7. Literature review — what actually works (and what to steal)
 
@@ -242,6 +271,8 @@ encoder/game/broker:
   matters a lot for this project).
 - Tastytrade account: futures approval level, CME data entitlement on API.
 - Reward design: per-tick vs per-trade vs hybrid.
-- Which instrument: /MNQ vs /MES (micro contracts; NQ moves more per unit time —
-  richer signal, harsher noise).
+- Which instrument: originally /MNQ vs /MES (micro contracts; NQ moves more per
+  unit time — richer signal, harsher noise). Resolved: /MBT, for 24/7 trading and a
+  cost structure that sets the window ladder (README "Why the ladder runs 30 s to
+  8 h"); the library recorder still captures the other micros for comparison.
 - Session protocol: how long, how often, same culture vs fresh cultures.

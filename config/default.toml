@@ -19,6 +19,8 @@ warmup_s = 120                # pre-session rest: baseline collection + short-wi
                               # (source.preroll), not by this rest.
 baseline_interactions = 60    # baseline windows used for spike-count normalization
 loop_hz = 20                  # CL closed-loop tick rate (budget 50 ms per tick)
+jitter_tolerance_ticks = 2    # loop may fall this many ticks behind the device before the CL SDK raises
+                              # TimeoutError (SDK default is 0: one slow tick would end a hardware session)
 accelerated = false           # true = decouple from wall clock (simulator only, non-live sources)
 score_metric = "pnl_after_costs"   # pnl_after_costs | directional_accuracy
 output_dir = "data/sessions"
@@ -57,6 +59,8 @@ streamer_symbol = ""          # optional explicit override, e.g. "BTC/USD:CXTALP
 roll_cutoff_days = 7          # never trade a contract within N days of its last trading day (MBT is monthly)
 roll_check_interval_s = 3600  # re-check the front month this often; on change: flatten, resubscribe, rotate recording
 stale_quote_s = 60            # no quote/trade events for this long -> game idles instead of trading a frozen book (0 = off)
+outage_timeout_s = 600        # the stream reconnects by itself (the DXLink quote token expires every 24 h); the game
+                              # idles meanwhile, and gives up if the outage outlasts this (0 = retry forever)
 
 [instrument]
 symbol = "/MBT"
@@ -90,8 +94,15 @@ momentum_down = [24, 25, 26, 27, 28, 29, 30, 31]  # row 3, full width: 30s -> 8h
 position_long = [32, 33, 40, 41]   # rows 4-5 as 2x2 blocks with guard columns
 position_flat = [35, 36, 43, 44]   # (c2/c5 unassigned) so the states don't blend
 position_short = [38, 39, 46, 47]
-pnl_up = [1, 2]               # row 0, split across reserved channel 4
-pnl_down = [5, 6]
+# Row 0 carries the two rate-coded scalar channels, one electrode each, with
+# valences mirrored around the reserved centre (c3 empty + c4 reference as the
+# guard): "good/up" (pnl_up, imbalance_bid) on the left, "bad/down" on the
+# right. Bid pressure sits next to PnL-up and ask pressure next to PnL-down,
+# so the only neighbours that bleed are of the same valence.
+pnl_up = [1]
+imbalance_bid = [2]           # bid-heavy book (buying pressure); rate = |smoothed imbalance|
+imbalance_ask = [5]           # ask-heavy book (selling pressure)
+pnl_down = [6]
 
 # Motor on the bottom two rows, maximally far from the strips (three rows of
 # separation); symmetric 2x3 blocks so the buy/sell differential count is
@@ -121,6 +132,13 @@ momentum_scale_window_s = 30.0  # calibration window (~1 sigma of BTC 30s drift)
                               # windows scale as 1/sqrt(window), so every strip
                               # channel spans the same 4-40 Hz range
 pnl_scale_points = 200.0      # unrealized PnL (points) that saturates the pnl signal ($20 on MBT)
+# Book-imbalance channel: (bid_size - ask_size) / (bid_size + ask_size) at the
+# top of the book, time-averaged over imbalance_window_s (the per-moment ratio
+# flips with every one-lot order; persistent pressure is the signal). Sign
+# picks imbalance_bid / imbalance_ask, tanh(mean / imbalance_scale) sets the
+# rate. Like the strip, silence until the window holds 3/4 of its span.
+imbalance_window_s = 30.0
+imbalance_scale = 0.4         # smoothed imbalance at which the channel reads ~0.76 (30 Hz); recalibrate per product
 
 [neural.decoding]
 normalization = "ratio"       # ratio | zscore (vs. pre-episode baseline spontaneous activity)

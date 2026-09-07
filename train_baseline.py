@@ -5,7 +5,8 @@ Usage:
     python train_baseline.py                                  # synthetic sine (should PASS: sanity check)
     python train_baseline.py --data synthetic:random_walk     # unlearnable control (should FAIL: no leakage)
     python train_baseline.py --data data/market/<recording>.jsonl.gz
-    python train_baseline.py --data <file1> --data <file2>    # multiple recordings
+    python train_baseline.py --data <file1> --data <file2>    # multiple recordings: read as one
+                                                              # stream (rotated files are stitched)
     python train_baseline.py --horizons 5,15,30,60 ...        # seconds-scale horizons (diagnostics only:
                                                               # /MBT moves at these horizons cannot clear costs)
 
@@ -19,8 +20,10 @@ Interpretation: if no model beats the majority-class share (outside the
 binomial CI) on real data at any horizon, the current encoding carries no
 signal and the game design needs work before renting wetware. The comparison
 is against the majority class, not 0.5: on a drifting test slice, always-up
-already scores the up-share. The 'extended' feature set shows whether
-candidate Phase-2 channels would help.
+already scores the up-share. The default probes the 'encoded' set -- exactly
+the channels the layout allocates (the momentum strip and the book-imbalance
+channel), computed by the live FeatureTracker; --sets strip removes the
+imbalance channel as a control, and extended / imbalance are diagnostics.
 """
 
 from __future__ import annotations
@@ -34,9 +37,10 @@ from pathlib import Path
 import numpy as np
 
 from src.baseline.backtest import backtest_proba
-from src.baseline.dataset import build_dataset, load_recording_series, synthetic_series
+from src.baseline.dataset import (STALE_S, build_dataset, calibrate_imbalance_scale, calibrate_momentum_scale,
+                                  load_recording_series, longest_feature_window_s, synthetic_series)
 from src.baseline.models import binomial_margin, fit_logistic, fit_mlp
-from src.config import load_config
+from src.config import apply_override, load_config
 from src.market.synthetic import REGIMES
 
 
@@ -45,9 +49,21 @@ def main() -> None:
     parser.add_argument("--data", action="append", default=None,
                         help="'synthetic:<regime>' or path to a recording; repeatable (default synthetic:sine)")
     parser.add_argument("--config", default="config/default.toml")
+    parser.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
+                        help="override a config value, e.g. --set instrument.tick_size=0.25")
+    parser.add_argument("--sets", default="encoded",
+                        help="comma list of feature sets to probe (default: encoded, what the neurons "
+                             "see). Others: strip (momentum ladder alone, the control for the "
+                             "imbalance channel), extended, imbalance (candidate-column diagnostics)")
+    parser.add_argument("--calibrate-scale", action="store_true",
+                        help="set neural.encoding.momentum_scale and imbalance_scale from the training "
+                             "rows (median |input| -> |norm| 0.48, the rule the /MBT defaults follow) "
+                             "so every channel is read in this product's units")
     parser.add_argument("--steps", type=int, default=50000,
-                        help="samples for synthetic data (~14 h at 1 s; hour-scale label "
-                             "horizons need room for the split-boundary purge)")
+                        help="usable samples for synthetic data (~14 h at 1 s; hour-scale label "
+                             "horizons need room for the split-boundary purge). A pre-roll "
+                             "covering the longest feature window is generated on top, so "
+                             "every column is live from the first sample, as in a live session")
     parser.add_argument("--snr", type=float, default=None, help="synthetic snr override")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--horizons", default="60,300,900,3600",
@@ -60,12 +76,15 @@ def main() -> None:
     args = parser.parse_args()
 
     cfg = load_config(args.config)
+    for override in args.set:
+        apply_override(cfg, override)
+    cfg.validate()
     horizons = [float(h) for h in args.horizons.split(",")]
     data_items = args.data or ["synthetic:sine"]
 
     segments = []
     descriptions = []
-    rec_ranges: list[tuple[float, float, str]] = []
+    recordings = [item for item in data_items if not item.startswith("synthetic:")]
     for item in data_items:
         if item.startswith("synthetic:"):
             regime = item.split(":", 1)[1]
@@ -74,31 +93,54 @@ def main() -> None:
             scfg = dataclasses.replace(cfg.market.synthetic, regime=regime, seed=args.seed)
             if args.snr is not None:
                 scfg.snr = args.snr
-            segments += synthetic_series(scfg, args.steps, args.step_interval)
+            segments += synthetic_series(scfg, args.steps, args.step_interval,
+                                         warm_s=longest_feature_window_s(cfg))
             descriptions.append(f"{item} steps={args.steps} snr={scfg.snr} seed={args.seed}")
-        else:
-            segs = load_recording_series(item, args.step_interval)
-            segments += segs
-            rec_ranges += [(float(s.t[0]), float(s.t[-1]), str(item)) for s in segs]
-            descriptions.append(str(item))
+    if recordings:
+        # One quote stream across all files (rotated files are stitched; only
+        # real gaps split it) in chronological order regardless of argument
+        # order, so the train/val/test split is temporal. The loader rejects
+        # files that overlap in time (leakage across the split).
+        # Gap handling follows the configured live session: idle past
+        # stale_quote_s (a live game idles through a maintenance break with
+        # its tracker intact), and a new segment only once the gap outlasts
+        # the longest feature window, where no state would survive anyway.
+        live = cfg.market.live
+        try:
+            segments += load_recording_series(
+                recordings, args.step_interval,
+                max_gap_s=longest_feature_window_s(cfg),
+                stale_s=live.stale_quote_s if live.stale_quote_s > 0 else STALE_S)
+        except RuntimeError as exc:
+            raise SystemExit(str(exc))
+        descriptions += recordings
 
-    # Recordings must not overlap in time: two files covering the same market
-    # window (e.g. a rotated file plus its overlap) would put identical prices
-    # on both sides of the train/test boundary -- leakage that reads as SIGNAL.
-    rec_ranges.sort()
-    for (a0, a1, pa), (b0, b1, pb) in zip(rec_ranges, rec_ranges[1:]):
-        if b0 <= a1:
-            raise SystemExit(f"recordings overlap in time:\n  {pa}\n  {pb}\n"
-                             "the same prices would land in both train and test")
-    if rec_ranges and not any(item.startswith("synthetic:") for item in data_items):
-        # Chronological splits regardless of the order files were passed in.
-        segments.sort(key=lambda s: float(s.t[0]))
+    enc = cfg.neural.encoding
+    imbalance_scale_calibrated = False
+    if args.calibrate_scale:
+        enc.momentum_scale = calibrate_momentum_scale(segments, enc.momentum_scale_window_s,
+                                                      args.step_interval)
+        print(f"momentum_scale calibrated on training rows: {enc.momentum_scale:.4g} points/s "
+              f"at {enc.momentum_scale_window_s:g}s")
+        imb_scale = calibrate_imbalance_scale(segments, enc.imbalance_window_s, args.step_interval)
+        if imb_scale is not None:
+            enc.imbalance_scale = imb_scale
+            imbalance_scale_calibrated = True
+            print(f"imbalance_scale calibrated on training rows: {enc.imbalance_scale:.4g} "
+                  f"(mean imbalance over {enc.imbalance_window_s:g}s)")
+        else:
+            print("imbalance_scale left at default: the book carries no sizes in this data")
 
     ds = build_dataset(segments, cfg, horizons, args.step_interval, args.min_move)
     n_tr, n_va, n_te = (int(ds.splits[k].sum()) for k in ("train", "val", "test"))
+    idle_rows = sum(int((~s.fresh_mask()).sum()) for s in segments)
     print(f"data: {'; '.join(descriptions)}")
     print(f"samples: {ds.n} (train {n_tr} / val {n_va} / test {n_te}), "
-          f"segments: {len(segments)}, cadence {args.step_interval}s")
+          f"segments: {len(segments)}, idle rows skipped: {idle_rows}, cadence {args.step_interval}s")
+    enc_names = ds.feature_names["encoded"]
+    dark = {name: float(np.mean(ds.X["encoded"][:, k] == 0.0)) for k, name in enumerate(enc_names)}
+    print(f"encoded (what the neurons see, {len(enc_names)} channels): " + ", ".join(enc_names))
+    print("  share of rows silent per channel: " + ", ".join(f"{n} {v:.0%}" for n, v in dark.items()))
 
     # CUDA is required unless CPU is requested explicitly: a silent fallback
     # would run the gate on a slower/different backend than the one the
@@ -130,13 +172,29 @@ def main() -> None:
         "data": descriptions, "n_samples": ds.n, "horizons_s": horizons,
         "band": args.band, "step_interval_s": args.step_interval,
         "instrument": dataclasses.asdict(cfg.instrument), "broker": dataclasses.asdict(cfg.broker),
+        "momentum_scale": cfg.neural.encoding.momentum_scale,
+        "momentum_scale_calibrated": bool(args.calibrate_scale),
+        "imbalance_window_s": cfg.neural.encoding.imbalance_window_s,
+        "imbalance_scale": cfg.neural.encoding.imbalance_scale,
+        "imbalance_scale_calibrated": imbalance_scale_calibrated,
+        "encoded_channels": enc_names, "encoded_silent_share": {k: round(v, 4) for k, v in dark.items()},
+        "segments": len(segments), "idle_rows_skipped": idle_rows,
+        "test_range_utc": [
+            time.strftime("%Y-%m-%d %H:%M", time.gmtime(float(ds.t[te][0]))),
+            time.strftime("%Y-%m-%d %H:%M", time.gmtime(float(ds.t[te][-1])))],
+        "test_hours": round(float(te.sum()) * args.step_interval / 3600.0, 1),
         "results": {},
     }
     curves: dict[str, dict] = {}
     equities: dict[str, np.ndarray] = {}
 
     model_kinds = ["logistic", "mlp"]
-    for set_name, X in ds.X.items():
+    wanted = [s.strip() for s in args.sets.split(",") if s.strip()] or list(ds.X)
+    unknown = [s for s in wanted if s not in ds.X]
+    if unknown:
+        raise SystemExit(f"unknown feature set(s) {unknown}; available: {list(ds.X)}")
+    for set_name in wanted:
+        X = ds.X[set_name]
         for kind in model_kinds:
             key = f"{set_name}/{kind}"
             per_h = {}
@@ -187,7 +245,10 @@ def main() -> None:
             report["results"][key] = {
                 "per_horizon": per_h, "best_horizon_s": best_h,
                 "backtest": {"dollars": bt.dollars, "points": bt.points, "n_trades": bt.n_trades,
-                             "win_rate": bt.win_rate, "n_signals": bt.n_signals},
+                             "win_rate": bt.win_rate, "n_signals": bt.n_signals,
+                             "n_long": sum(1 for x in bt.trades if x["direction"] == "long"),
+                             "n_short": sum(1 for x in bt.trades if x["direction"] == "short"),
+                             "trades": bt.trades},
                 "random_policy": rnd,
             }
             curves[key] = per_h
@@ -220,6 +281,7 @@ def _plot(curves: dict, equities: dict, horizons: list[float], out_dir: Path) ->
     import matplotlib.pyplot as plt
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 5))
+    majority: dict[float, float] = {}
     for key, per_h in curves.items():
         hs = [h for h in horizons if h in per_h and "test_acc" in per_h[h]]
         if not hs:
@@ -227,10 +289,18 @@ def _plot(curves: dict, equities: dict, horizons: list[float], out_dir: Path) ->
         accs = [per_h[h]["test_acc"] for h in hs]
         errs = [per_h[h]["ci_half_width"] for h in hs]
         ax1.errorbar(hs, accs, yerr=errs, marker="o", capsize=3, label=key)
-    ax1.axhline(0.5, color="gray", ls="--", lw=1)
-    ax1.set_xlabel("horizon (s)")
+        for h in hs:
+            majority[h] = per_h[h]["majority_acc"]
+    # The no-skill reference is the majority class at each horizon (the same
+    # test labels for every probe), not 0.5: a drifting slice makes "always
+    # up" score the up-share for free.
+    if majority:
+        hs = sorted(majority)
+        ax1.plot(hs, [majority[h] for h in hs], color="gray", ls="--", lw=1, marker="_",
+                 label="majority class (no skill)")
+    ax1.set_xlabel("label horizon (s)")
     ax1.set_ylabel("test directional accuracy")
-    ax1.set_title("Predictability of forward move")
+    ax1.set_title("Predictability of forward move (all inputs, per target horizon)")
     ax1.legend(fontsize=8)
     ax1.grid(alpha=0.3)
 

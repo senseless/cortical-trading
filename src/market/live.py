@@ -5,6 +5,16 @@ lock-protected latest-state snapshot; the CL closed loop reads it without
 blocking. An optional MarketRecorder archives every event into the replay
 library while streaming.
 
+Reconnects: the DXLink connection is not permanent. The quote token tastytrade
+issues is valid for 24 h and is cached account-wide, so every stream on the
+account dies at the same wall-clock minute each day (see token_expires_at);
+websockets also drop for ordinary network reasons. When the stream fails, the
+book is cleared (snapshot() returns None, the game idles), the source
+reconnects with capped backoff and resubscribes the current symbol, and play
+resumes with the next quote. An outage longer than cfg.outage_timeout_s makes
+snapshot() raise instead, so a dead feed cannot silently consume a wetware
+session.
+
 Contract rolls: when the symbol is auto-resolved from a product code, a
 watcher re-resolves it every roll_check_interval_s (honoring roll_cutoff_days,
 see tasty.py). When the answer changes, pending_roll() becomes non-None; the
@@ -19,14 +29,18 @@ Two staleness rules:
   maintenance windows, dead feeds): the game idles instead of trading -- and
   the paper broker filling at -- a frozen book.
 - dxFeed pushes the last known quote/trade immediately on (re)subscribe.
-  That snapshot is history, not live data: it updates the in-memory state
-  (the standing book is real) but is NOT recorded, so a connection cycle
-  against a closed market writes nothing to the replay library.
+  That snapshot is history, not live data: it updates the in-memory book (the
+  standing book is real) but is NOT recorded, so a connection cycle against a
+  closed market writes nothing to the replay library, and it is aged by the
+  exchange's own timestamp rather than by arrival time, so reconnecting
+  across a closed market cannot pass a pre-closure book off as live.
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
+import json
 import logging
 import math
 import threading
@@ -47,7 +61,60 @@ def _f(value) -> float:
     return float(value)
 
 
+def _leaves(exc: BaseException):
+    """Flatten ExceptionGroups (the SDK's TaskGroup wraps streamer failures)."""
+    if isinstance(exc, BaseExceptionGroup):
+        for sub in exc.exceptions:
+            yield from _leaves(sub)
+    else:
+        yield exc
+
+
+def _leaf_error(exc: BaseException) -> str:
+    """Human-readable cause: the first real error inside any ExceptionGroup."""
+    leaf = next(_leaves(exc), exc)
+    return f"{type(leaf).__name__}: {leaf}"
+
+
+def _is_stream_failure(exc: BaseException) -> bool:
+    """True if this is a dead stream (retryable), not cancellation or Ctrl-C.
+
+    Matters because a group containing CancelledError/KeyboardInterrupt must
+    propagate: retrying it would spin the reconnect loop during shutdown.
+    """
+    return all(isinstance(leaf, Exception) for leaf in _leaves(exc))
+
+
+def _event_wall(event_ms: float, now: float) -> float:
+    """Local-clock time of an event from its exchange timestamp (epoch ms).
+
+    Falls back to `now` when the feed's stamp is missing or implausible, so a
+    product that does not populate it behaves exactly as before.
+    """
+    if math.isnan(event_ms) or event_ms <= 0:
+        return now
+    t = event_ms / 1000.0
+    if t > now + 5.0 or t < now - 30.0 * 86400.0:
+        return now  # clock skew, or a stamp that is not epoch milliseconds
+    return t
+
+
+def jwt_expiry(token: str) -> float | None:
+    """Epoch expiry of a JWT's `exp` claim (no signature check), or None."""
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(payload))
+        exp = claims.get("exp")
+        return float(exp) if exp is not None else None
+    except Exception:
+        return None
+
+
 class LiveSource(MarketSource):
+    RECONNECT_BACKOFF_S = 5.0
+    RECONNECT_BACKOFF_MAX_S = 60.0
+
     def __init__(self, cfg: LiveCfg, recorder: MarketRecorder | None = None):
         self.cfg = cfg
         self.recorder = recorder
@@ -71,7 +138,7 @@ class LiveSource(MarketSource):
         self._rolling = False          # a roll switch is in flight on the stream thread
         self._roll_started = 0.0       # wall time complete_roll() was called
         self._connected = threading.Event()
-        self._error: BaseException | None = None
+        self._error: BaseException | None = None   # fatal: the stream thread is gone
         self._error_tb: str = ""
         self._stop: asyncio.Event | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -80,6 +147,14 @@ class LiveSource(MarketSource):
         self._Quote = self._Trade = None
         self._preroll_duration_s = 0.0         # remembered for post-roll backfill
         self._pending_preroll: list[MarketSnapshot] = []  # under _lock
+        # Reconnect state (under _lock unless noted).
+        self._down_since = 0.0                 # wall time the stream dropped; 0 = up
+        self._last_stream_error = ""           # stream thread only; read for diagnostics
+        self._notices: list[str] = []          # human-readable events for the driver to log
+        self._stale_noticed = False            # game thread only
+        self.disconnects = 0                   # stream thread only
+        self._connects = 0                     # stream thread only
+        self.token_expires_at: float | None = None  # epoch; DXLink quote token expiry, if decodable
 
     def describe(self) -> str:
         return f"live:{self.symbol or self.cfg.product_code}"
@@ -97,8 +172,9 @@ class LiveSource(MarketSource):
             if self._error:
                 detail = f"\n{self._error_tb}" if self._error_tb else ""
                 raise RuntimeError(f"DXLink connection failed: {self._error}{detail}") from self._error
+            hint = f" (last stream error: {self._last_stream_error})" if self._last_stream_error else ""
             raise TimeoutError(
-                f"no market data received for {self.symbol or self.cfg.product_code} within {timeout_s}s"
+                f"no market data received for {self.symbol or self.cfg.product_code} within {timeout_s}s{hint}"
             )
 
     def stop(self) -> None:
@@ -113,6 +189,16 @@ class LiveSource(MarketSource):
         if self.recorder:
             self.recorder.close()
 
+    def drain_notices(self) -> list[str]:
+        """Connection events (drops, reconnects) since the last call, oldest first."""
+        with self._lock:
+            out, self._notices = self._notices, []
+        return out
+
+    def _notify(self, message: str) -> None:
+        with self._lock:
+            self._notices.append(message)
+
     def _thread_main(self, session) -> None:
         try:
             asyncio.run(self._stream(session))
@@ -121,7 +207,6 @@ class LiveSource(MarketSource):
             self._error_tb = traceback.format_exc()
 
     async def _stream(self, session) -> None:
-        from tastytrade import DXLinkStreamer
         from tastytrade.dxfeed import Quote, Trade
 
         from .tasty import days_until_stop, resolve_trading_contract
@@ -142,30 +227,107 @@ class LiveSource(MarketSource):
             path = self.record_path or default_recording_path(self.symbol, self.record_dir or "data/market")
             self.recorder = MarketRecorder(path, symbol=self.symbol,
                                            meta={"trading_symbol": self.trading_symbol})
+
+        watcher = asyncio.create_task(self._watch_roll(session)) if self._watch_rolls else None
+        stop_task = asyncio.create_task(self._stop.wait())
+        backoff = self.RECONNECT_BACKOFF_S
+        try:
+            while True:
+                connects_before = self._connects
+                try:
+                    await self._stream_once(session, stop_task)
+                    return  # stop requested
+                except (Exception, BaseExceptionGroup) as exc:
+                    if self._stop.is_set():
+                        return
+                    if not _is_stream_failure(exc):
+                        raise  # cancellation / interrupt: do not retry
+                    if self._connects > connects_before:
+                        # This attempt did connect and ran for a while, so the
+                        # backoff earned by earlier failures is spent; a daily
+                        # token expiry must not inherit a minute of waiting.
+                        backoff = self.RECONNECT_BACKOFF_S
+                    self._on_disconnect(exc, backoff)
+                done, _ = await asyncio.wait({stop_task}, timeout=backoff)
+                if done:
+                    return
+                backoff = min(backoff * 2.0, self.RECONNECT_BACKOFF_MAX_S)
+        finally:
+            for task in (watcher, stop_task):
+                if task is not None:
+                    task.cancel()
+
+    async def _stream_once(self, session, stop_task: asyncio.Task) -> None:
+        """One websocket lifetime: connect, subscribe, listen until stop or failure."""
+        from tastytrade import DXLinkStreamer
+
         async with DXLinkStreamer(session) as streamer:
             self._streamer = streamer
-            await streamer.subscribe(Quote, [self.symbol])
-            await streamer.subscribe(Trade, [self.symbol])
+            # Every connection is handed the account's cached token; note when
+            # it runs out so the driver can see the drop coming.
+            self.token_expires_at = await self._quote_token_expiry(session) or self.token_expires_at
+            self._skip_snapshot_quote = self._skip_snapshot_trade = True
+            await streamer.subscribe(self._Quote, [self.symbol])
+            await streamer.subscribe(self._Trade, [self.symbol])
+            self._on_connected()
             tasks = {
-                asyncio.create_task(self._listen_quotes(streamer, Quote)),
-                asyncio.create_task(self._listen_trades(streamer, Trade)),
+                asyncio.create_task(self._listen_quotes(streamer, self._Quote)),
+                asyncio.create_task(self._listen_trades(streamer, self._Trade)),
             }
-            if self._watch_rolls:
-                tasks.add(asyncio.create_task(self._watch_roll(session)))
-            stop_task = asyncio.create_task(self._stop.wait())
-            done, pending = await asyncio.wait(
-                tasks | {stop_task}, return_when=asyncio.FIRST_COMPLETED
-            )
-            for task in pending:
-                task.cancel()
+            try:
+                done, _ = await asyncio.wait(tasks | {stop_task}, return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+            if stop_task in done:
+                return
             for task in done:
-                if task is not stop_task and task.exception():
+                if task.exception():
                     raise task.exception()
-            if stop_task not in done:
-                # A listener ended without an exception: the server closed the
-                # stream. Without this, snapshot() would serve the last quote
-                # forever and the game would keep trading a frozen market.
-                raise RuntimeError("market data stream ended unexpectedly")
+            # A listener ended without an exception: the server closed the
+            # stream. Without this, snapshot() would serve the last quote
+            # forever and the game would keep trading a frozen market.
+            raise RuntimeError("market data stream ended unexpectedly")
+
+    def _on_connected(self) -> None:
+        self._connects += 1
+        with self._lock:
+            was_down = self._down_since
+            self._down_since = 0.0
+        if was_down:
+            self._notify(f"market data stream reconnected after {time.time() - was_down:.0f}s "
+                         f"(subscribed {self.symbol})")
+
+    def _on_disconnect(self, exc: BaseException, backoff: float) -> None:
+        self.disconnects += 1
+        self._last_stream_error = _leaf_error(exc)
+        with self._lock:
+            first = not self._down_since
+            if first:
+                self._down_since = time.time()
+            # Never serve a dead stream's book: snapshot() returns None until
+            # the resubscribe snapshot repopulates it.
+            self._bid = self._ask = self._last = math.nan
+            self._bid_size = self._ask_size = 0.0
+        if first:
+            self._notify(f"market data stream dropped: {self._last_stream_error}; reconnecting")
+        log.warning("market data stream failed (%s); reconnecting in %.0fs", self._last_stream_error, backoff)
+
+    @staticmethod
+    async def _quote_token_expiry(session) -> float | None:
+        """Expiry of the account's cached DXLink quote token (a JWT), best effort.
+
+        tastytrade hands every connection the same token until it expires, so
+        the stream is guaranteed to drop at this moment; the driver can warn
+        when a planned session spans it.
+        """
+        try:
+            data = await session._get("/api-quote-tokens")
+            return jwt_expiry(data["token"])
+        except Exception as exc:
+            log.debug("quote token expiry unavailable: %s", exc)
+            return None
 
     @staticmethod
     def _describe_contract(contract, days_left: float, note: str) -> str:
@@ -177,7 +339,7 @@ class LiveSource(MarketSource):
 
     CANDLE_INTERVAL = "1m"          # preroll resolution; the strip's shortest window is 30 s,
                                     # but preroll only needs to anchor the minutes-to-hours end
-    CANDLE_SILENCE_S = 3.0          # no candle for this long = history dump complete
+    CANDLE_SILENCE_S = 3.0          # fallback: no candle for this long = history dump complete
     CANDLE_FETCH_TIMEOUT_S = 45.0
 
     def preroll(self, duration_s: float, step_s: float = 1.0) -> list[MarketSnapshot]:
@@ -207,18 +369,23 @@ class LiveSource(MarketSource):
     async def _fetch_history(self, symbol: str, duration_s: float) -> list[MarketSnapshot]:
         """Subscribe to 1m candles with a from-time, drain the history dump.
 
-        dxFeed replays the requested range as a burst of Candle events, then
-        keeps streaming the live candle; a few seconds of silence marks the
-        end of the burst. Candle closes become bid=ask=mid snapshots stamped
-        with the candle's epoch time -- the momentum strip only needs mids.
+        dxFeed replays the requested range as a snapshot burst whose last
+        event carries the SNAPSHOT_END (or SNAPSHOT_SNIP) flag, then keeps
+        streaming the live candle. The flag is the primary stop; a few seconds
+        of silence and a hard deadline remain as fallbacks. Candle closes
+        become bid=ask=mid snapshots stamped with the candle's epoch time --
+        the momentum strip only needs mids.
         """
         from tastytrade.dxfeed import Candle
 
+        streamer = self._streamer
+        if streamer is None:
+            raise RuntimeError("stream not connected")
         cutoff = time.time() - duration_s
         start = datetime.fromtimestamp(cutoff - 120.0, tz=timezone.utc)
-        await self._streamer.subscribe_candle([symbol], self.CANDLE_INTERVAL, start_time=start)
+        await streamer.subscribe_candle([symbol], self.CANDLE_INTERVAL, start_time=start)
         closes: dict[float, float] = {}
-        gen = self._streamer.listen(Candle)
+        gen = streamer.listen(Candle)
         deadline = self._loop.time() + self.CANDLE_FETCH_TIMEOUT_S - 5.0
         try:
             while True:
@@ -235,13 +402,15 @@ class LiveSource(MarketSource):
                 close = _f(c.close)
                 if not math.isnan(close):
                     closes[c.time / 1000.0] = close  # dxFeed times are epoch ms
+                if c.snapshot_end or c.snapshot_snip:
+                    break  # last event of the history dump
         finally:
             try:
                 await gen.aclose()
             except Exception:
                 pass
             try:
-                await self._streamer.unsubscribe_candle(symbol, self.CANDLE_INTERVAL)
+                await streamer.unsubscribe_candle(symbol, self.CANDLE_INTERVAL)
             except Exception:
                 pass  # backfill is best-effort; never poison the stream for it
         return [MarketSnapshot(t=t, bid=px, ask=px, last=px)
@@ -266,8 +435,6 @@ class LiveSource(MarketSource):
     # -- contract rolls --------------------------------------------------------
 
     async def _watch_roll(self, session) -> None:
-        import inspect
-
         from .tasty import days_until_stop, resolve_trading_contract
 
         failures = 0
@@ -277,9 +444,7 @@ class LiveSource(MarketSource):
                 if self._pending_contract is not None or self._rolling:
                     continue  # waiting for the driver to complete the previous roll
             try:
-                refresh = session.refresh()
-                if inspect.iscoroutine(refresh):
-                    await refresh
+                # The session refreshes its own access token per request.
                 contract, note = await resolve_trading_contract(
                     session, self.cfg.product_code, self.cfg.roll_cutoff_days
                 )
@@ -330,6 +495,17 @@ class LiveSource(MarketSource):
         asyncio.run_coroutine_threadsafe(self._apply_roll(), self._loop)
 
     async def _apply_roll(self) -> None:
+        """Switch symbol, recorder, and subscriptions to the pending contract.
+
+        The network calls are best-effort because the stream may be
+        mid-reconnect: stale events for the old symbol are dropped by the
+        listeners' symbol filter, and a reconnect subscribes whatever
+        self.symbol is at that moment. Anything else failing here (a recorder
+        rotation, say) can leave the switch half-applied -- symbol changed but
+        still writing the old contract's file -- so it is fatal: the error goes
+        to snapshot() and the session finalizes rather than silently mixing two
+        contracts into one recording.
+        """
         from .tasty import days_until_stop
 
         try:
@@ -339,8 +515,12 @@ class LiveSource(MarketSource):
                 return
             contract, note = pending
             old = self.symbol
-            await self._streamer.unsubscribe(self._Quote, [old])
-            await self._streamer.unsubscribe(self._Trade, [old])
+            streamer = self._streamer
+            try:
+                await streamer.unsubscribe(self._Quote, [old])
+                await streamer.unsubscribe(self._Trade, [old])
+            except Exception as exc:
+                log.warning("unsubscribe %s failed (%s); stale events are filtered by symbol", old, exc)
             with self._lock:
                 self._bid = self._ask = self._last = math.nan
                 self._bid_size = self._ask_size = 0.0
@@ -357,8 +537,11 @@ class LiveSource(MarketSource):
                 self.recorder.rotate(self.symbol, new_path, meta={"trading_symbol": self.trading_symbol,
                                                                   "rolled_from": old})
             self._skip_snapshot_quote = self._skip_snapshot_trade = True
-            await self._streamer.subscribe(self._Quote, [self.symbol])
-            await self._streamer.subscribe(self._Trade, [self.symbol])
+            try:
+                await streamer.subscribe(self._Quote, [self.symbol])
+                await streamer.subscribe(self._Trade, [self.symbol])
+            except Exception as exc:
+                log.warning("subscribe %s failed (%s); the reconnect will subscribe it", self.symbol, exc)
             if self._preroll_duration_s > 0:
                 # Detached on purpose: the strip refill takes seconds of
                 # network time and must not extend the roll's data outage.
@@ -366,6 +549,12 @@ class LiveSource(MarketSource):
         except BaseException as exc:
             self._error = exc
             self._error_tb = traceback.format_exc()
+            # The switch is half-applied and the recorder may still point at the
+            # old contract's file. Stop recording now (MarketRecorder refuses
+            # writes after close) so the seconds before the session notices the
+            # error cannot append the new contract's quotes to the old file.
+            if self.recorder:
+                self.recorder.close()
         finally:
             with self._lock:
                 self._pending_contract = None
@@ -381,16 +570,22 @@ class LiveSource(MarketSource):
             bid, ask = _f(q.bid_price), _f(q.ask_price)
             if math.isnan(bid) or math.isnan(ask):
                 continue
+            # First quote after (re)subscribe is dxFeed's snapshot of the last
+            # known state: a valid book, but as old as the last change. Age it
+            # by the exchange's own stamp instead of "now", or a reconnect
+            # across a market closure would present a pre-closure book as live
+            # and stale_quote_s would never fire.
+            snapshot_event = self._skip_snapshot_quote
+            event_wall = (_event_wall(max(_f(q.bid_time), _f(q.ask_time)), now)
+                          if snapshot_event else now)
             with self._lock:
                 self._bid, self._ask = bid, ask
                 self._bid_size, self._ask_size = _f(q.bid_size), _f(q.ask_size)
                 self._quote_count += 1
-                self._last_event_wall = now
+                self._last_event_wall = max(self._last_event_wall, event_wall)
             self._connected.set()
-            if self._skip_snapshot_quote:
-                # First quote after (re)subscribe is dxFeed's snapshot of the
-                # last known state -- valid book, wrong time; don't record it.
-                self._skip_snapshot_quote = False
+            if snapshot_event:
+                self._skip_snapshot_quote = False  # history, not a live tick: don't record
             elif self.recorder:
                 self.recorder.quote(now, bid, ask, _f(q.bid_size), _f(q.ask_size))
 
@@ -402,12 +597,14 @@ class LiveSource(MarketSource):
             price = _f(tr.price)
             if math.isnan(price):
                 continue
+            snapshot_event = self._skip_snapshot_trade
+            event_wall = _event_wall(_f(tr.time), now) if snapshot_event else now
             with self._lock:
                 self._last = price
                 self._trade_count += 1
-                self._last_event_wall = now
+                self._last_event_wall = max(self._last_event_wall, event_wall)
             self._connected.set()
-            if self._skip_snapshot_trade:
+            if snapshot_event:
                 self._skip_snapshot_trade = False  # subscribe snapshot, see quotes
             elif self.recorder:
                 self.recorder.trade(now, price, _f(tr.size))
@@ -426,14 +623,29 @@ class LiveSource(MarketSource):
             raise RuntimeError(f"DXLink stream failed: {self._error}") from self._error
         with self._lock:
             rolling, roll_started = self._rolling, self._roll_started
+            down_since = self._down_since
             bid, ask, last = self._bid, self._ask, self._last
             bs, as_ = self._bid_size, self._ask_size
             last_event = self._last_event_wall
+        if down_since:
+            # Reconnecting. Idle, unless the outage has gone on long enough
+            # that idling is just burning the session.
+            outage = time.time() - down_since
+            if self.cfg.outage_timeout_s > 0 and outage > self.cfg.outage_timeout_s:
+                raise RuntimeError(
+                    f"market data stream has been down for {outage:.0f}s "
+                    f"(> outage_timeout_s={self.cfg.outage_timeout_s:g}); last error: "
+                    f"{self._last_stream_error}")
+            return None
         stale_s = self.cfg.stale_quote_s
         if stale_s > 0 and last_event > 0 and time.time() - last_event > stale_s:
             # No event for stale_quote_s: maintenance window or dead feed.
             # Serving the cached book would let the game fill paper trades at
             # prices nobody can actually trade; idle instead until data flows.
+            if not self._stale_noticed:
+                self._stale_noticed = True
+                self._notify(f"market data stale (no events for {time.time() - last_event:.0f}s); "
+                             "idling until quotes resume")
             return None
         if rolling:
             # The switch is in flight on the stream thread; until it clears the
@@ -449,4 +661,7 @@ class LiveSource(MarketSource):
             return None
         if math.isnan(last):
             last = (bid + ask) / 2.0
+        if self._stale_noticed:
+            self._stale_noticed = False
+            self._notify("market data resumed")
         return MarketSnapshot(t=time.time(), bid=bid, ask=ask, last=last, bid_size=bs, ask_size=as_)

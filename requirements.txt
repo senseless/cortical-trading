@@ -5,8 +5,12 @@ matplotlib>=3.8
 rich>=13.7
 python-dotenv>=1.0
 joblib>=1.3
-tastytrade
-cl-sdk
+# Pinned to the major versions the code is written against: live.py / tasty.py
+# rely on the tastytrade 13 async Session (_get auto-refresh, DXLinkStreamer
+# context manager, Candle.event_flags); session/runner.py and neural/*.py on
+# the cl-sdk 1.x closed-loop API (Loop jitter_tolerance_frames, StimDesign).
+tastytrade>=13.2,<14
+cl-sdk>=1.0,<2
 # baseline MLP -- CUDA required by train_baseline.py (--device cpu to override):
 # pip install torch --index-url https://download.pytorch.org/whl/cu126
 torch>=2.4

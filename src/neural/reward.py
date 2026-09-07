@@ -39,7 +39,7 @@ import numpy as np
 from ..config import RewardCfg
 from ..game.state import StepResult
 from .layout import ElectrodeLayout
-from .stim import StimCommand
+from .stim import StimCommand, occupancy_s
 
 
 @dataclass
@@ -49,6 +49,7 @@ class FeedbackEvent:
     reward: float                              # signed reward value (points)
     commands: list[StimCommand] = field(default_factory=list)
     pause_s: float = 0.0                       # suspend env steps while noise plays out
+    duration_s: float = 0.0                    # how long the commands occupy their channels
 
 
 class RewardGenerator:
@@ -57,11 +58,12 @@ class RewardGenerator:
         self.cfg = cfg
         self.layout = layout
         self._rng = np.random.default_rng(seed)
-        # Holding feedback cadence in env steps; the counter tracks how long
-        # the current position has been held so the first evaluation happens a
-        # full interval after entry, never on the entry step itself.
+        # Holding feedback cadence in env steps. _steps_held counts completed
+        # steps the current position has been held (0 on the entry step), so
+        # the first evaluation happens a full interval after entry, never on
+        # the entry step itself.
         self._holding_steps = max(1, round(cfg.holding_interval_s / step_interval_s))
-        self._steps_in_position = 0
+        self._steps_held = 0
         # Full feedback spans encoding AND decoding regions (play is paused for
         # its window, so its evoked spikes never reach a decision). Mini
         # (holding / per-tick) feedback has no pause -- its evoked activity
@@ -82,14 +84,16 @@ class RewardGenerator:
 
         allow_holding=False suppresses holding minis while keeping the hold
         clock ticking: the runner passes it on an episode's final step, where
-        the flatten's full feedback lands on the same tick -- a mini stacked
-        on top would push the concurrent per-channel stim rate (sensory
-        encoding + mini + full burst) past the CL1 200 Hz budget that config
-        validation guarantees for any two trains.
+        the flatten's full feedback lands on the same tick -- the SDK would
+        serialize a mini ahead of it and the full feedback would start late.
         """
         timing = self.cfg.timing
+        held = 0
         if step.position == 0:
-            self._steps_in_position = 0
+            self._steps_held = 0
+        else:
+            held = self._steps_held
+            self._steps_held += 1
         # Full feedback on closed trades (per_trade and hybrid). Net of costs:
         # on /MBT the ~$4 round trip is worth 40 points, so rewarding gross
         # points would praise trades that lose money after commissions and
@@ -109,11 +113,10 @@ class RewardGenerator:
         # PnL on a slow cadence. No pause is attached (mini feedback), which is
         # a requirement, not a convenience: the punishment must never lock the
         # culture out of the closing action that would end it.
-        if timing == "hybrid" and step.position != 0:
-            self._steps_in_position += 1
-            if allow_holding and self._steps_in_position % self._holding_steps == 0 \
-                    and abs(step.unrealized_points) > self.cfg.holding_deadband_points:
-                return self._build(step.unrealized_points, full=False)
+        if timing == "hybrid" and step.position != 0 and allow_holding \
+                and held > 0 and held % self._holding_steps == 0 \
+                and abs(step.unrealized_points) > self.cfg.holding_deadband_points:
+            return self._build(step.unrealized_points, full=False)
         return None
 
     def _build(self, reward: float, full: bool) -> FeedbackEvent:
@@ -131,22 +134,31 @@ class RewardGenerator:
             # punishment pause: the burst drives every motor channel, so the
             # next decision must not decode a window full of evoked spikes.
             pause = self.cfg.predictable_window_s if full else 0.0
+            commands, duration = self._predictable(full)
             return FeedbackEvent(kind="predictable", full=full, reward=reward,
-                                 commands=self._predictable(full), pause_s=pause)
+                                 commands=commands, pause_s=pause, duration_s=duration)
         pause = (self.cfg.unpredictable_s + self.cfg.pause_after_loss_s) if full else 0.0
+        commands, duration = self._unpredictable(full)
         return FeedbackEvent(kind="unpredictable", full=full, reward=reward,
-                             commands=self._unpredictable(full), pause_s=pause)
+                             commands=commands, pause_s=pause, duration_s=duration)
 
     # -- stimulus construction ---------------------------------------------------
 
-    def _predictable(self, full: bool) -> list[StimCommand]:
-        """Structured bursts at predictable_hz (full: all channels; mini: sensory only)."""
+    MINI_UNPREDICTABLE_S = 0.3  # noise window of a mini punishment
+
+    def _predictable(self, full: bool) -> tuple[list[StimCommand], float]:
+        """Structured bursts at predictable_hz (full: all channels; mini: sensory only).
+
+        Returns the commands and the seconds they occupy their channels.
+        """
         channels = self._feedback_channels if full else self._mini_channels
+        if not channels:
+            return [], 0.0  # layout with no sensory groups: mini feedback has no sites
         n_bursts = self.cfg.predictable_bursts if full else 1
         burst_pulses = max(1, int(round(self.cfg.predictable_hz * self.cfg.predictable_burst_ms / 1000.0)))
         window = self.cfg.predictable_window_s if full else 0.0
         spacing = window / n_bursts if n_bursts > 1 else 0.0
-        return [
+        commands = [
             StimCommand(
                 channels=channels, rate_hz=self.cfg.predictable_hz,
                 count=burst_pulses, delay_s=i * spacing,
@@ -154,13 +166,17 @@ class RewardGenerator:
             )
             for i in range(n_bursts)
         ]
+        return commands, max(occupancy_s(c) + c.delay_s for c in commands)
 
-    def _unpredictable(self, full: bool) -> list[StimCommand]:
-        """Random-site, random-time single stims -- maximally unpredictable input."""
+    def _unpredictable(self, full: bool) -> tuple[list[StimCommand], float]:
+        """Random-site, random-time single stims -- maximally unpredictable input.
+
+        Returns the commands and the noise window they are spread over.
+        """
         channels = self._feedback_channels if full else self._mini_channels
         if not channels:
-            return []  # layout with no sensory groups: mini feedback has no sites
-        duration = self.cfg.unpredictable_s if full else 0.3
+            return [], 0.0  # layout with no sensory groups: mini feedback has no sites
+        duration = self.cfg.unpredictable_s if full else self.MINI_UNPREDICTABLE_S
         # Event budget scaled like DishBrain's 5 Hz over its 8-electrode sensory area.
         n_events = max(1, int(round(self.cfg.unpredictable_rate_hz * duration * len(channels) / 8.0)))
         commands = []
@@ -171,4 +187,4 @@ class RewardGenerator:
                 channels=[channel], rate_hz=0.0, count=1, delay_s=delay,
                 amplitude_ua=self.cfg.feedback_amplitude_ua, tag="reward:unpredictable",
             ))
-        return commands
+        return commands, duration

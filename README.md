@@ -85,8 +85,9 @@ Requires Python 3.11+. Synthetic and replay sessions need no credentials.
    frequency 4-40 Hz = magnitude (rate coding). Momentum is delivered on two
    chronotopic strips (up and down), with timescale as a spatial axis: the
    k-th window of `momentum_windows_s` stimulates the k-th electrode along
-   the strip. The neurons' current position is also place-coded so they can
-   "feel" it.
+   the strip. Book imbalance (bid-heavy vs. ask-heavy, time-averaged over
+   `imbalance_window_s`) is place-coded by sign on its own pair of electrodes.
+   The neurons' current position is also place-coded so they can "feel" it.
 3. Spikes are counted per motor region over the step window, normalized
    against pre-episode baseline activity, and decoded into an action:
    buy / sell / hold (open long, open short, close long, close short).
@@ -124,7 +125,7 @@ them. The default layout (`[neural.layout]` in `config/default.toml`):
 
 ```
         c0    c1    c2    c3    c4    c5    c6    c7
-  r0    xx    U+    U+     .    xx    U-    U-    xx
+  r0    xx    U+    B+     .    xx    B-    U-    xx    scalar channels: PnL, book
   r1   M+1   M+2   M+3   M+4   M+5   M+6   M+7   M+8    up strip:   30s -> 8h
   r2     .     .     .     .     .     .     .     .    guard row
   r3   M-1   M-2   M-3   M-4   M-5   M-6   M-7   M-8    down strip: 30s -> 8h
@@ -136,7 +137,8 @@ them. The default layout (`[neural.layout]` in `config/default.toml`):
 
 `xx` reserved &nbsp;|&nbsp; `.` unassigned (still recorded) &nbsp;|&nbsp;
 sensory: `M+k`/`M-k` momentum up/down at the k-th timescale (`momentum_windows_s`
-= 30 s, 1 m, 5 m, 15 m, 30 m, 1 h, 4 h, 8 h), `PL/PF/PS` position
+= 30 s, 1 m, 5 m, 15 m, 30 m, 1 h, 4 h, 8 h), `B+/B-` book imbalance
+bid-heavy/ask-heavy (`imbalance_window_s` = 30 s mean), `PL/PF/PS` position
 long/flat/short, `U+/U-` unrealized PnL up/down &nbsp;|&nbsp; motor:
 `BUY`/`SEL` decode regions
 
@@ -145,6 +147,19 @@ Why this shape:
 - **Place + rate coding.** Each signal gets a dedicated electrode group
   (*where* = meaning); stimulation frequency (4-40 Hz) carries magnitude.
   Exactly-zero signals are silence, not a weak positive.
+- **Trains end inside their step.** The CL SDK reserves a channel for
+  `count/rate` seconds per burst and serializes commands per channel: a
+  train that runs even slightly past the step boundary delays the next
+  step's train, and the delay compounds every step (measured: +87 ms/step at
+  4.6 Hz), until the stimulus the culture decodes describes a market state
+  from many seconds ago. Each step therefore delivers `floor(rate * window)`
+  pulses at exactly the requested rate. When a mini feedback lands on a step,
+  it plays first at its exact time and the step's sensory trains start after
+  it, shortened to fit; the episode's final step delivers no sensory train
+  at all (nothing decodes it, and the flatten's feedback must start on
+  time). The runner models the SDK's per-channel availability and reports
+  any command that still starts late as `late_stims` / `max_stim_delay_s`
+  in `metrics.json`; both should be 0.
 - **Chronotopic momentum strips.** Timescale runs along each strip, short to
   long — "chronotopy", by analogy with the tonotopic frequency axis of
   auditory cortex. Adjacent electrodes recruit overlapping populations, and
@@ -160,11 +175,22 @@ Why this shape:
   the same time — a pattern no single-window encoding can represent.
 - **Opposite valences separated.** Stimulation activates tissue beyond the
   target electrode (~100 um), so groups whose meanings are opposites
-  (`M+`/`M-` on separate rows, `U+`/`U-` split across reserved c4, `PL`/`PS`
-  at opposite ends of their rows with guard columns c2/c5) get physical
-  separation — blending them would destroy the signal they carry. The cost of
-  a 64-electrode budget is that r0's PnL groups sit directly above the up
-  strip; cross-*signal* bleed is tolerated where cross-*valence* bleed is not.
+  (`M+`/`M-` on separate rows, `U+`/`U-` and `B+`/`B-` mirrored around the
+  reserved centre of r0, `PL`/`PS` at opposite ends of their rows with guard
+  columns c2/c5) get physical separation — blending them would destroy the
+  signal they carry. The cost of a 64-electrode budget is that r0's scalar
+  groups sit directly above the up strip; cross-*signal* bleed is tolerated
+  where cross-*valence* bleed is not.
+- **Scalar channels share r0, one electrode each, sorted by valence.** Row 0
+  holds the two rate-coded scalar signals — unrealized PnL and book
+  imbalance — with the "good" side (`U+`, `B+`) left of the reserved c4 and
+  the "bad" side (`B-`, `U-`) right of it, c3 left empty as a second guard.
+  A bid-heavy book therefore stimulates next to PnL-up and an ask-heavy book
+  next to PnL-down: the only neighbours that bleed agree in sign. Single
+  electrodes suffice for stimulation groups (DishBrain place-coded eight ball
+  positions on eight single electrodes); the alternative, spending the
+  position rows' guard columns, would have put a 40 Hz group one row above
+  the motor regions, which the next principle forbids.
 - **Sensory top, motor bottom.** Maximizing distance between stimulation
   sites and decode regions keeps directly evoked activity from dominating
   the spike counts the decoder reads; the decision should ride on network
@@ -217,12 +243,35 @@ for a fully warm strip), the live source backfills 1-minute DXLink candles,
 and the synthetic source generates the path. `session.warmup_s` (default
 120 s) remains as pre-session rest for baseline collection, and rests keep
 feeding the feature tracker without stimulating, so history stays unbroken
-across them. Note the externalization: the culture needs no 8-hour memory —
+across them. The same silence rule covers *gaps*: after a stretch with no
+quotes (a CME maintenance window, a stream reconnect) a window stays dark
+until its anchor spans at least three quarters of the window again, because
+a velocity measured over a few post-gap seconds is noise many times the
+calibrated scale and would fire a saturated burst in a random direction.
+Note the externalization: the culture needs no 8-hour memory —
 the tracker holds the history and the strip delivers its summary as a
 present-tense spatial pattern. One honest caveat: the long-end channels are
 quasi-static for tens of minutes at a time, and cultures habituate to
 unvarying stimulation, so the 4-8 h channels act as slow context bias rather
 than dynamic drive.
+
+### The book-imbalance channel
+
+Top-of-book imbalance, `(bid_size - ask_size) / (bid_size + ask_size)`, is
+the one non-price input: who is queued to trade, rather than what has traded.
+On a micro book the top level is a handful of contracts and the per-moment
+ratio flips with every one-lot order, so the channel carries its
+`imbalance_window_s` (30 s) time average — persistent one-sided pressure,
+the version with predictive evidence behind it in the order-flow literature.
+Sign picks the electrode (`B+` bid-heavy, `B-` ask-heavy), and
+`tanh(mean / imbalance_scale)` sets the rate, with `imbalance_scale`
+calibrated like the strip's (median |input| reads |norm| 0.48; the default
+0.4 is /MBT's, `--calibrate-scale` recomputes it per product). The same
+silence rule applies: the channel is dark until its window holds three
+quarters of its span, so a post-gap value built from a couple of quotes never
+fires a saturated burst. Candle history has no sizes, so the pre-roll cannot
+seed it — but it only needs 30 s, and the pre-session rest feeds the tracker,
+so it is live from the first step.
 
 ## Contract rolls
 
@@ -245,6 +294,28 @@ the background and re-seeds the strip at the next step boundary, so the long
 timescales come back within seconds rather than hours. Rolls are monthly and
 checked hourly, so a given session rarely sees one.
 
+## Live stream lifetime
+
+The DXLink connection is not permanent. tastytrade issues one quote token per
+account, valid 24 h and cached, so every stream on the account drops at the
+same wall-clock minute each day; ordinary websocket failures happen too. The
+live source logs the token's expiry at startup (and warns when the planned
+session spans it), and on any drop it clears the book, reconnects with capped
+backoff, and resubscribes the current contract. While disconnected,
+`snapshot()` returns `None`: the game idles rather than trading a frozen
+book, exactly as during a `stale_quote_s` silence. dxFeed replays the last
+known quote on every (re)subscribe, and that replay is aged by the exchange's
+own timestamp rather than by arrival time — so reconnecting across a market
+closure cannot pass a pre-closure book off as live. Drops and reconnects are
+printed at the next step boundary and counted in `metrics.json`
+(`market_disconnects`). An outage longer than `market.live.outage_timeout_s`
+(default 10 min) ends the session instead of burning wetware time on a dead
+feed. A session that ends early for any reason (Ctrl-C, CL tick-budget
+`TimeoutError`, feed failure) closes any open paper position against the last
+quote if one exists, logs it as an `abort_flatten` row, and records
+`interrupted` / `completed` / `open_position` in `metrics.json`, so partial
+sessions are never mistaken for full ones in analysis.
+
 ## Curriculum
 
 Synthetic regimes in increasing difficulty: `sine`, `trend`, `trend_noise`,
@@ -259,19 +330,61 @@ cadence after real costs, the game design needs work before spending wetware
 rental time. Label horizons default to holding-period scale (1 m - 1 h),
 matching where /MBT moves clear costs. It reports directional accuracy per
 horizon against the majority-class benchmark (with overlap-adjusted
-confidence intervals) for both the current neural encoding (the chronotopic
-strip, one column per window, computed by the same `FeatureTracker` the live
-encoder uses) and an extended candidate-channel set — returns over windows
-from 1 s to 8 h, vol-normalized variants, volatility regime, spread, book
-imbalance, range position, time of day — and backtests the resulting policies
-through the real game engine and paper broker against time-shifted luck
-baselines. Extended return columns use the same per-window 1/sqrt(w) scale as
-the strip, so a candidate column that shows signal can be promoted onto the
-strip without recalibration. The hour-scale windows and label horizons only
+confidence intervals) for the current neural encoding — the `encoded` set:
+every sensory market channel the layout allocates, i.e. the chronotopic strip
+(one column per window) and the book-imbalance channel, computed by the same
+`FeatureTracker` the live encoder uses, so the gate probes exactly what the
+neurons see and follows the layout automatically — and backtests the
+resulting policies through the real game engine and paper broker against
+time-shifted luck baselines. `--sets` adds diagnostics: `strip` (the
+momentum ladder without the imbalance channel, the control for what the
+channel adds), `extended` (candidate columns: returns over windows from 1 s
+to 8 h, vol-normalized variants, volatility regime, spread, range position,
+time of day) and `imbalance` (the raw book alone, instantaneous and smoothed
+over several windows). Extended return columns use the same per-window
+1/sqrt(w) scale as the strip, so a candidate column that shows signal can be
+promoted onto the strip without recalibration. The hour-scale windows and label horizons only
 mean anything on multi-day contiguous recordings, which is what the
 `--forever` library builder accumulates — the 4 h and 8 h strip windows ship
 *unvalidated* until those recordings exist, and the per-window gate results
-are how the ladder gets pruned or extended on evidence.
+are how the ladder gets pruned or extended on evidence. One asymmetry to keep
+in mind when reading gate results on recordings: a live session pre-rolls the
+strip from history, but the dataset builder starts each recording segment
+cold, so the long windows are dark (zero) for the first hours of every
+segment and the "encoded" set there is a *conservative* version of what the
+neurons see. Pass the whole library (`--data` per file, any order): the files
+are read as one quote stream, so the recorder's 6 h rotation seams do not
+restart the windows. Gaps follow the live session's own rules: after
+`stale_quote_s` (60 s) without a quote the game idles, so those rows are
+skipped by the strip tracker and excluded from the dataset, and a new segment
+starts only after a silence longer than the longest feature window (8 h),
+past which no tracker state would survive anyway. A live game idles straight
+through the daily CME maintenance break with its history intact
+(`outage_timeout_s` only applies to a *disconnected* stream), so the loader
+does too: splitting at the break had left the 8 h channel dark for the first
+8 h of every 23 h day (37% of `/MES` rows, 19% for the 4 h channel), and
+splitting at two minutes had turned a week of `/MBT` into 46 segments over
+weekend quote silences. With the live rules a week of `/MES` is one segment
+and the 8 h channel is dark only on the 11% of rows that follow the weekend.
+Synthetic series are generated with a matching pre-roll, so on them every
+column is live from the first row.
+
+The gate runs on any recorded product, not just `/MBT`: `--set` overrides
+config values the same way `run_session.py` does (`--set
+instrument.point_value=5 --set instrument.tick_size=0.25` for `/MES`), and
+`--calibrate-scale` sets `momentum_scale` from the training rows by the rule
+the `/MBT` default follows (median |velocity| over the 30 s window lands at
+|norm| 0.48), so the strip is read in that product's units instead of bitcoin
+points, and `imbalance_scale` by the same rule on the smoothed imbalance.
+Without it a slow product reads all-zero and a fast one saturates. The
+calibrated values, the encoded column names and each channel's silent share
+are written to `report.json`. In every report, "best@300s" names the
+*label horizon* a probe was trained to predict, not an input: every probe
+sees all of its set's columns on every row. Two things the multi-product run
+made visible: the fixed scale is regime-dependent (the `/MBT` default was
+calibrated on a busy weekday; the quiet weekend gives half that), and
+tick-quantized products (`/M6E`, `/MHG`, `/SIL`) barely move within 30 s at
+1 s cadence, so the shortest strip channels are mostly silent on them.
 
 On the synthetic sine sanity check (re-parameterized to a 30-minute period so
 the signal lives at holding-period scale), the strip reads SIGNAL on every

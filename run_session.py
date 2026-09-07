@@ -11,32 +11,8 @@ from __future__ import annotations
 import argparse
 import json
 
-from src.config import Config, load_config
+from src.config import apply_override, load_config
 from src.session import SessionRunner
-
-
-def apply_override(cfg: Config, dotted: str) -> None:
-    if "=" not in dotted:
-        raise SystemExit(f"--set expects key.path=value, got: {dotted}")
-    path, raw_value = dotted.split("=", 1)
-    parts = path.strip().split(".")
-    target = cfg
-    for part in parts[:-1]:
-        if not hasattr(target, part):
-            raise SystemExit(f"unknown config section: {path}")
-        target = getattr(target, part)
-    leaf = parts[-1]
-    if not hasattr(target, leaf):
-        raise SystemExit(f"unknown config key: {path}")
-    current = getattr(target, leaf)
-    value: object = raw_value
-    if isinstance(current, bool):
-        value = raw_value.strip().lower() in ("1", "true", "yes", "on")
-    elif isinstance(current, int):
-        value = int(raw_value)
-    elif isinstance(current, float):
-        value = float(raw_value)
-    setattr(target, leaf, value)
 
 
 def main() -> None:

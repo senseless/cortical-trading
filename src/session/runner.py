@@ -93,6 +93,11 @@ class SessionRunner:
         log_fh = open(self.out_dir / "steps.jsonl", "w", encoding="utf-8")
         wall_start = time.time()
         dropped_stims = 0
+        late_stims = 0          # commands that queued behind busy channels
+        max_late_ticks = 0.0
+        late_warned = False
+        interrupted = False
+        planned_s = sum(d for _, _, d in phases) / loop_hz  # excludes feedback pauses
 
         try:
             with self.source, ConsoleView(cfg.session.console) as view:
@@ -100,6 +105,7 @@ class SessionRunner:
                 contract_desc = getattr(self.source, "contract_desc", "")
                 if contract_desc:
                     view.log(f"contract: {contract_desc}")
+                self._log_token_expiry(view, planned_s)
                 # Pre-roll: seed the feature tracker with history covering the
                 # ladder's longest window, so the whole strip is live from the
                 # first episode instead of taking hours to warm in-session.
@@ -134,27 +140,42 @@ class SessionRunner:
                     step_in_episode = 0
                     pause_ticks = 0
                     last_stim_end_tick = -(10 ** 9)  # long before the first window
+                    i = 0  # last tick seen; the abort path needs a game time
+                    current_episode = 0
 
+                    # The SDK's jitter check is in device frames (25 kHz); the
+                    # config expresses the slack in loop ticks.
+                    jitter_frames = int(round(cfg.session.jitter_tolerance_ticks
+                                              * neurons.get_frames_per_second() / loop_hz))
                     try:
-                        for tick in neurons.loop(ticks_per_second=loop_hz):
+                        for tick in neurons.loop(ticks_per_second=loop_hz,
+                                                 jitter_tolerance_frames=jitter_frames):
                             i = tick.iteration
                             for spike in tick.analysis.spikes:
                                 if 0 <= spike.channel < cfg.neural.channels:
                                     counts[spike.channel] += 1
-                            due_cmds = scheduler.due(i)
-                            if due_cmds:
-                                last_stim_end_tick = max(last_stim_end_tick, i)
-                            for cmd in due_cmds:
+                            for cmd in scheduler.due(i):
                                 if not issue(neurons, cl_mod, cmd):
                                     dropped_stims += 1
-                                elif cmd.count > 1 and cmd.rate_hz > 0:
-                                    # A burst keeps playing (count-1)/rate seconds
-                                    # after issue; the baseline stim-free guard
-                                    # must measure from the END of playback, or
-                                    # a sensory burst's tail (up to ~1 s) leaks
-                                    # into the first "spontaneous" window.
-                                    end = i + math.ceil((cmd.count - 1) / cmd.rate_hz * loop_hz)
-                                    last_stim_end_tick = max(last_stim_end_tick, end)
+                                    continue
+                                # The SDK plays a command when its channels are
+                                # free, not when it is issued. Track both: the
+                                # baseline stim-free guard must measure from the
+                                # END of playback (a sensory train's tail would
+                                # otherwise leak into the first "spontaneous"
+                                # window), and a late START means the command
+                                # queued behind earlier stimulation -- the
+                                # encoder/runner are built so that never
+                                # happens, so count it if it does.
+                                late, end = scheduler.mark_issued(i, cmd)
+                                last_stim_end_tick = max(last_stim_end_tick, math.ceil(end))
+                                if late >= 1.0:
+                                    late_stims += 1
+                                    max_late_ticks = max(max_late_ticks, late)
+                                    if not late_warned and late >= ticks_per_step:
+                                        late_warned = True
+                                        view.log(f"warning: {cmd.tag} started {late / loop_hz:.2f}s late "
+                                                 "(channels still busy); see late_stims in metrics.json")
 
                             if phase_idx >= len(phases):
                                 # Drain before ending: the final flatten's
@@ -166,11 +187,12 @@ class SessionRunner:
                                     break
                                 continue
                             kind, episode, duration = phases[phase_idx]
+                            current_episode = episode
                             tick_in_phase += 1
                             boundary = tick_in_phase % ticks_per_step == 0
 
                             if kind == "rest" and boundary:
-                                self._drain_backfill(view)
+                                self._drain_source_events(view)
                                 if self.source.pending_roll():
                                     self._handle_roll(neurons, stream, scheduler, i, episode,
                                                       i / loop_hz, view, log_fh)
@@ -194,7 +216,7 @@ class SessionRunner:
                                 view.update(self._view_state(phase="rest", episode=episode, step=self.baseline.n_windows))
 
                             elif kind == "episode" and boundary:
-                                self._drain_backfill(view)
+                                self._drain_source_events(view)
                                 if pause_ticks > 0:
                                     pause_ticks = max(0, pause_ticks - ticks_per_step)
                                     if pause_ticks == 0:
@@ -248,8 +270,17 @@ class SessionRunner:
                                     self.decoder.reset()
                                     self._prime_episode(scheduler, i, counts)
                     except KeyboardInterrupt:
+                        interrupted = True
                         view.log("interrupted -- finalizing session")
                     finally:
+                        # The loop only ends flat when it completes normally.
+                        # Any other exit (Ctrl-C, tick-budget TimeoutError,
+                        # stream failure) can leave a paper position open; close
+                        # it if a quote exists so the trade record is complete.
+                        try:
+                            self._abort_flatten(neurons, stream, i / loop_hz, current_episode, view, log_fh)
+                        except Exception as exc:
+                            view.log(f"warning: exit flatten failed: {exc}")
                         # Finalize the HDF5 recording even when the loop dies
                         # (tick-budget TimeoutError, stream failure): a rented
                         # wetware session's data must survive its crash.
@@ -268,10 +299,30 @@ class SessionRunner:
                     "mode": cfg.session.mode,
                     "market": self.source.describe(),
                     "wall_seconds": round(time.time() - wall_start, 1),
+                    "planned_seconds": round(planned_s, 1),
                     "dropped_stims": dropped_stims,
+                    # Stimulus timing integrity: commands that could not start
+                    # on their tick because a channel was still playing an
+                    # earlier one, and the worst such delay. Both should be 0.
+                    "late_stims": late_stims,
+                    "max_stim_delay_s": round(max_late_ticks / loop_hz, 3),
                     "n_predictable": self.n_predictable,
                     "n_unpredictable": self.n_unpredictable,
+                    # A session cut short is not comparable to a full one; the
+                    # analysis tooling must be able to tell them apart.
+                    "interrupted": interrupted,
+                    "completed": failure is None and not interrupted,
+                    "market_disconnects": getattr(self.source, "disconnects", 0),
                 })
+                if self.engine.open_trade is not None:
+                    trade = self.engine.open_trade
+                    metrics["open_position"] = {
+                        "direction": trade.direction, "entry_price": trade.entry_price,
+                        "entry_t": trade.entry_t, "costs": trade.costs,
+                        "unrealized_points_at_last_mark": (
+                            self.engine.unrealized_points(self.engine.last_mid)
+                            if self.engine.last_mid is not None else None),
+                    }
                 if failure is not None:
                     metrics["error"] = f"{type(failure).__name__}: {failure}"
                 (self.out_dir / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
@@ -287,12 +338,74 @@ class SessionRunner:
         action, debug = self.decoder.decide(window_counts, self.baseline)
         return action, debug
 
-    def _drain_backfill(self, view) -> None:
-        """Seed history that arrived asynchronously (post-roll candle backfill)."""
+    def _drain_source_events(self, view) -> None:
+        """Absorb what the source produced asynchronously since the last boundary.
+
+        Post-roll candle backfill seeds the (already reset) feature tracker;
+        connection notices (stream drops and reconnects) go to the console log
+        so an operator can see why the game idled.
+        """
         snaps = self.source.take_preroll()
         if snaps:
             self.features.seed(snaps)
             view.log(f"momentum strip re-seeded from {len(snaps)} backfilled candles")
+        drain = getattr(self.source, "drain_notices", None)
+        if drain is not None:
+            for note in drain():
+                view.log(note)
+
+    def _log_token_expiry(self, view, planned_s: float) -> None:
+        """Say when the live stream will drop, and whether this session spans it."""
+        expires_at = getattr(self.source, "token_expires_at", None)
+        if not expires_at:
+            return
+        remaining = expires_at - time.time()
+        when = time.strftime("%H:%M:%S", time.localtime(expires_at))
+        if remaining < planned_s:
+            view.log(f"warning: the DXLink quote token expires at {when} ({remaining / 60:.0f} min from "
+                     f"now), inside this session's planned {planned_s / 60:.0f} min; the stream will "
+                     "drop and reconnect then (the game idles until quotes resume)")
+        else:
+            view.log(f"DXLink quote token valid until {when} ({remaining / 3600:.1f} h)")
+
+    def _abort_flatten(self, neurons, stream, t_game: float, episode: int, view, log_fh) -> None:
+        """Close a position left open by an abnormal loop exit, if a quote exists.
+
+        No feedback is generated: the closed loop is gone, nothing could
+        deliver it, and counting undeliverable feedback as delivered would
+        corrupt the session metrics. The row is labeled as a forced close, not
+        a decision. With no quote (dead stream), the position stays open and
+        is reported in metrics as open_position instead.
+        """
+        if self.engine.position == 0:
+            return
+        try:
+            snap = self.source.snapshot(t_game)
+        except Exception:
+            snap = None
+        if snap is None:
+            view.log(f"warning: exiting with an open position ({self.engine.position:+d}) and no quote "
+                     "to close it against; see open_position in metrics.json")
+            return
+        result = self.engine.flatten(snap)
+        if result is None:
+            return
+        self._log_row(log_fh, stream, neurons, dict(
+            t=round(t_game, 3), wall_t=time.time(), episode=episode, step=-1,
+            mid=snap.mid, bid=snap.bid, ask=snap.ask,
+            momentum_norms=[], vol_points=0.0,
+            action="abort_flatten", executed=result.executed, position=result.position,
+            mtm_points=round(result.mtm_points, 4),
+            unrealized_points=0.0,
+            realized_points=round(result.realized_points, 4),
+            realized_dollars=round(result.realized_dollars, 2),
+            closed_trade=dataclasses.asdict(result.closed_trade) if result.closed_trade else None,
+            reward=0.0, feedback_kind=None, feedback_full=None,
+            decoder={}, counts=[],
+        ))
+        trade = result.closed_trade
+        view.log(f"open position closed on exit: {trade.dollars:+.2f} USD "
+                 f"(session realized ${self.engine.realized_dollars:+.2f})")
 
     def _prime_episode(self, scheduler, now_tick: int, counts: np.ndarray) -> None:
         """Deliver the sensory stimulus for the current state (episode start / pause end)."""
@@ -327,8 +440,8 @@ class SessionRunner:
         feedback = None
         if self.cfg.session.mode == "agent":
             # No holding mini on the final step: the episode-end flatten's full
-            # feedback is scheduled on this same tick, and stacking both trains
-            # (plus sensory) would breach the 200 Hz per-channel stim budget.
+            # feedback is scheduled on this same tick, and the SDK would play
+            # the mini first and start the full feedback late.
             feedback = self.reward.evaluate(result, allow_holding=not final_step)
             if feedback:
                 scheduler.schedule(now_tick, feedback.commands)
@@ -337,19 +450,34 @@ class SessionRunner:
                 else:
                     self.n_unpredictable += 1
 
-        if feedback is None or feedback.pause_s <= 0:
-            sensory = self.encoder.encode_step(feats, self.engine.position, result.unrealized_points)
+        # Sensory encoding for this step. The CL SDK serializes stimulation per
+        # channel, so whatever is issued first on a tick plays first and the
+        # rest waits. Three cases:
+        #  - final step: nothing. No decision follows, the flatten's feedback
+        #    is issued on this same tick and must start on time, and the rest
+        #    that follows must be stim-free.
+        #  - feedback with a pause: nothing. The pause-expiry re-prime delivers
+        #    fresh sensory state; scheduling it here would mix market-dependent
+        #    stim into the feedback (making "predictable" less predictable) and
+        #    double the sensory dose around every pause.
+        #  - mini feedback (no pause): the mini plays first, at its exact time,
+        #    and the sensory trains start after it and are shortened to end
+        #    inside the step. Issuing them at the tick would queue them behind
+        #    the mini and push every later step's trains out by that much.
+        if not final_step and (feedback is None or feedback.pause_s <= 0):
+            offset_s = 0.0
+            if feedback is not None and feedback.duration_s > 0:
+                loop_hz = self.cfg.session.loop_hz
+                offset_s = math.ceil(feedback.duration_s * loop_hz - 1e-9) / loop_hz
+            sensory = self.encoder.encode_step(feats, self.engine.position, result.unrealized_points,
+                                               start_offset_s=offset_s)
             scheduler.schedule(now_tick, sensory)
-        # else: play is paused for the feedback window and the pause-expiry
-        # re-prime delivers fresh sensory state; scheduling sensory here too
-        # would only mix market-dependent stim into the feedback being
-        # delivered (making the "predictable" reward less predictable) and
-        # double the sensory dose around every pause.
 
         row = dict(
             t=round(t_game, 3), wall_t=time.time(), episode=episode, step=step,
             mid=snap.mid, bid=snap.bid, ask=snap.ask,
             momentum_norms=[round(v, 4) for v in feats["momentum_norms"]],
+            imbalance_norm=round(feats.get("imbalance_norm", 0.0), 4),
             vol_points=round(feats["vol_points"], 4),
             action=action.value, executed=result.executed, position=result.position,
             mtm_points=round(result.mtm_points, 4),
@@ -426,8 +554,11 @@ class SessionRunner:
         if not ok:
             view.log(f"warning: episode {episode} position NOT flattened (no market data); "
                      "it will carry into the next episode")
-        view.log(f"episode {episode} done: realized ${self.engine.realized_dollars:+.2f} "
-                 f"({len(self.engine.trades)} trades)")
+        # Engine totals are session-cumulative; label them as such so the line
+        # is not read as this episode's result (metrics.json has the per-episode
+        # breakdown).
+        view.log(f"episode {episode} done: session realized ${self.engine.realized_dollars:+.2f} "
+                 f"({len(self.engine.trades)} trades so far)")
 
     def _handle_roll(self, neurons, stream, scheduler, now_tick, episode, t_game, view, log_fh) -> float:
         """Contract roll: flatten on the old contract, re-anchor, then resubscribe.

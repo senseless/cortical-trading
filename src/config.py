@@ -30,6 +30,12 @@ class SessionCfg:
     # (MarketSource.preroll) at session start, not by this rest.
     warmup_s: float = 120.0
     loop_hz: int = 20
+    # How far (in loop ticks) the closed loop may fall behind the device before
+    # the CL SDK raises TimeoutError. The SDK default is zero tolerance: on
+    # hardware a single slow tick (GC pause, file flush, OS scheduling) would
+    # end the rented session. A couple of ticks of slack costs nothing on the
+    # ~1 s decision cadence.
+    jitter_tolerance_ticks: float = 2.0
     accelerated: bool = False
     score_metric: str = "pnl_after_costs"
     output_dir: str = "data/sessions"
@@ -68,6 +74,11 @@ class LiveCfg:
     roll_cutoff_days: float = 7.0  # never trade a contract this close to its last trading day
     roll_check_interval_s: float = 3600.0  # how often the live source re-resolves the contract
     stale_quote_s: float = 60.0  # no events for this long -> snapshot() returns None (game idles); 0 disables
+    # The DXLink stream reconnects on its own after a drop (the quote token
+    # expires every 24 h, websockets die). The game idles meanwhile; if the
+    # outage lasts longer than this, snapshot() raises so the session
+    # finalizes instead of silently burning wetware time. 0 = retry forever.
+    outage_timeout_s: float = 600.0
 
 
 @dataclass
@@ -107,9 +118,22 @@ class EncodingCfg:
     # to round-trip costs; long windows are fed by pre-roll history.
     momentum_windows_s: list[float] = field(
         default_factory=lambda: [30.0, 60.0, 300.0, 900.0, 1800.0, 3600.0, 14400.0, 28800.0])
+    # Velocity (points/s) that saturates the 30 s window; other windows follow
+    # the 1/sqrt(w) law below. Verified against 15 h of recorded /MBT: median
+    # |norm| lands at 0.45-0.51 on every window from 30 s to 1 h with ~5%
+    # saturation and ~5% near-silence, and each window's implied 30 s-referenced
+    # scale agrees within 1.05-1.21 -- i.e. the strip uses its dynamic range and
+    # the sqrt law holds on this instrument. Recalibrate per product.
     momentum_scale: float = 1.2
     momentum_scale_window_s: float = 30.0
     pnl_scale_points: float = 200.0
+    # Book-imbalance channel (layout groups imbalance_bid / imbalance_ask):
+    # top-of-book (bid_size - ask_size) / (bid_size + ask_size), time-averaged
+    # over imbalance_window_s -- the per-moment ratio flips with every one-lot
+    # order on a thin micro book; persistent one-sided pressure is the signal.
+    # Sign -> which group (place), tanh(mean / imbalance_scale) -> rate.
+    imbalance_window_s: float = 30.0
+    imbalance_scale: float = 0.4
 
     def scale_for_window(self, window_s: float) -> float:
         """Points-per-second that saturates the signal for a given window.
@@ -219,6 +243,16 @@ class Config:
                 "ascending: the order along the strip *is* the timescale axis")
         if self.neural.encoding.momentum_scale_window_s <= 0:
             raise ValueError("neural.encoding.momentum_scale_window_s must be > 0")
+        if self.neural.encoding.imbalance_window_s <= 0:
+            raise ValueError("neural.encoding.imbalance_window_s must be > 0")
+        if self.neural.encoding.imbalance_scale <= 0:
+            raise ValueError("neural.encoding.imbalance_scale must be > 0")
+        # The imbalance channel is place-coded by sign, so it needs both groups
+        # or neither; with only one, half the signal would be silently dropped.
+        imb_groups = [g for g in ("imbalance_bid", "imbalance_ask") if g in self.neural.sensory]
+        if len(imb_groups) == 1:
+            raise ValueError("neural.layout.sensory needs both imbalance_bid and imbalance_ask "
+                             f"(or neither); found only {imb_groups[0]}")
         for group in ("momentum_up", "momentum_down"):
             chans = self.neural.sensory.get(group)
             if chans is not None and len(chans) != len(windows):
@@ -255,16 +289,23 @@ class Config:
                     f"within predictable_window_s={r.predictable_window_s:g} overlap "
                     f"(spacing {spacing_s * 1000:.0f} ms < burst length); they would stack "
                     "past the CL1 200 Hz per-channel limit")
-        # The same limit applies to *concurrent* trains: feedback bursts hit
-        # every sensory+motor channel while sensory encoding is still playing
-        # into the same step window, so the worst-case per-channel rate is the
-        # sum, not the max.
+        # Feedback bursts land on channels that may still be playing a sensory
+        # train. The CL SDK serializes stims per channel (a stim issued on a
+        # busy channel starts when the channel frees up, it never stacks), so
+        # overlapping trains cannot exceed the rate limit -- they get
+        # *delayed*, which breaks the feedback contingency instead. The runner
+        # avoids overlap by construction: the encoder sizes each sensory train
+        # to end inside its step (floor(rate * window) pulses, the SDK reserves
+        # count/rate), feedback is issued at a step boundary, and on a mini
+        # feedback step the sensory trains are delayed behind the mini. The
+        # runner reports any command that still starts late (late_stims in
+        # metrics.json). This sum check is a conservative extra guard.
         max_sensory_hz = max(self.neural.encoding.f_max_hz, self.neural.encoding.position_rate_hz)
         if max_sensory_hz + self.neural.reward.predictable_hz > 200.0:
             raise ValueError(
                 f"sensory ({max_sensory_hz} Hz) + feedback ({self.neural.reward.predictable_hz} Hz) "
-                "can stimulate the same channel concurrently at "
-                f"{max_sensory_hz + self.neural.reward.predictable_hz} Hz, over the CL1 200 Hz limit")
+                f"sum to {max_sensory_hz + self.neural.reward.predictable_hz} Hz; keep the pair "
+                "under the CL1 200 Hz per-channel budget so overlapping trains stay short")
         if self.instrument.point_value <= 0 or self.instrument.tick_size <= 0:
             raise ValueError("instrument.point_value and tick_size must be positive "
                              "(PnL and net-points feedback divide by them)")
@@ -285,6 +326,10 @@ class Config:
         if self.session.loop_hz <= 0 or self.session.step_interval_s <= 0:
             raise ValueError("session.loop_hz and step_interval_s must be positive "
                              "(they define the closed-loop clock)")
+        if self.session.jitter_tolerance_ticks < 0:
+            raise ValueError("session.jitter_tolerance_ticks must be >= 0")
+        if self.market.live.outage_timeout_s < 0 or self.market.live.stale_quote_s < 0:
+            raise ValueError("market.live.outage_timeout_s and stale_quote_s must be >= 0 (0 disables)")
         if self.session.rest_s < 0 or self.session.baseline_interactions <= 0:
             raise ValueError("session.rest_s must be >= 0 and baseline_interactions > 0")
         if self.session.warmup_s < 0:
@@ -314,6 +359,31 @@ def _apply(dc: Any, data: dict[str, Any], subsections: tuple[str, ...] = ()) -> 
         if not hasattr(dc, key):
             raise ValueError(f"unknown config key '{key}' in {name}")
         setattr(dc, key, value)
+
+
+def apply_override(cfg: Config, dotted: str) -> None:
+    """Apply a `section.key=value` command-line override, typed like the current value."""
+    if "=" not in dotted:
+        raise SystemExit(f"--set expects key.path=value, got: {dotted}")
+    path, raw_value = dotted.split("=", 1)
+    parts = path.strip().split(".")
+    target = cfg
+    for part in parts[:-1]:
+        if not hasattr(target, part):
+            raise SystemExit(f"unknown config section: {path}")
+        target = getattr(target, part)
+    leaf = parts[-1]
+    if not hasattr(target, leaf):
+        raise SystemExit(f"unknown config key: {path}")
+    current = getattr(target, leaf)
+    value: object = raw_value
+    if isinstance(current, bool):
+        value = raw_value.strip().lower() in ("1", "true", "yes", "on")
+    elif isinstance(current, int):
+        value = int(raw_value)
+    elif isinstance(current, float):
+        value = float(raw_value)
+    setattr(target, leaf, value)
 
 
 def load_config(path: str | Path) -> Config:

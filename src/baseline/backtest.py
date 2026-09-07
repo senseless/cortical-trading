@@ -30,6 +30,9 @@ class BacktestResult:
     win_rate: float
     n_signals: int
     equity: np.ndarray = field(repr=False, default=None)
+    # Per-trade record (direction, times, prices, PnL) so a result can be read
+    # for *how* it made or lost money, not just how much.
+    trades: list[dict] = field(default_factory=list, repr=False)
 
 
 def _signals_from_proba(proba: np.ndarray, band: float) -> np.ndarray:
@@ -91,6 +94,12 @@ def run_policy(
         win_rate=round(wins / len(trades), 3) if trades else 0.0,
         n_signals=int(np.count_nonzero(exec_signals)),
         equity=equity,
+        trades=[{
+            "direction": "long" if tr.direction > 0 else "short",
+            "entry_t": tr.entry_t, "exit_t": tr.exit_t, "hold_s": round(tr.exit_t - tr.entry_t, 1),
+            "entry_price": tr.entry_price, "exit_price": tr.exit_price,
+            "points": round(tr.points, 2), "dollars": round(tr.dollars, 2),
+        } for tr in trades],
     )
 
 

@@ -211,19 +211,11 @@ class MultiRecorder:
                 feed.recorder.trade(now, price, _f(tr.size))
 
     async def _watch_rolls(self, session) -> None:
-        import inspect
-
         from .tasty import days_until_stop, resolve_trading_contract
 
         while True:
             await asyncio.sleep(self.roll_check_interval_s)
-            try:
-                refresh = session.refresh()
-                if inspect.iscoroutine(refresh):
-                    await refresh
-            except Exception as exc:
-                log.warning("session refresh failed during roll check: %s", exc)
-                continue
+            # The session refreshes its own access token per request.
             with self._lock:
                 feeds = list(self.feeds.values())
             for feed in feeds:

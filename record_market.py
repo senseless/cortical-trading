@@ -54,7 +54,12 @@ def acquire_singleton() -> socket.socket | None:
 
 def record_once(args, duration_s: float, stall_timeout_s: float = 0.0) -> None:
     """One single-product recording session. Raises on stream failure or stall."""
-    source = LiveSource(LiveCfg(product_code=args.product, streamer_symbol=args.symbol))
+    # outage_timeout_s=0: a recorder's job is to keep collecting, so it waits
+    # out any outage instead of giving up (the session default gives up to
+    # avoid burning wetware time). --forever's stall watchdog still restarts a
+    # feed that reconnects but never delivers.
+    source = LiveSource(LiveCfg(product_code=args.product, streamer_symbol=args.symbol,
+                                outage_timeout_s=0.0))
     source.record_path = args.out
     source.record_dir = "data/market"
 
@@ -79,6 +84,8 @@ def record_once(args, duration_s: float, stall_timeout_s: float = 0.0) -> None:
                 # recorder path here.
                 print(f"contract roll: {roll.old_streamer_symbol} -> {roll.new_streamer_symbol}{note} "
                       "-- recorder rotates when the switch completes", flush=True)
+            for notice in source.drain_notices():
+                print(f"[{time.strftime('%H:%M:%S')}] {notice}", flush=True)
             q, tr = source.counts
             snap = source.snapshot(0)
             px = f"bid {snap.bid} / ask {snap.ask} last {snap.last}" if snap else "no quote yet"
