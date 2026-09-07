@@ -13,7 +13,7 @@ _EXTENDED_FLAGS = 0x0080
 
 
 def _strip(norms) -> str:
-    """Render the chronotopic momentum strip, short window first.
+    """Render a chronotopic strip (momentum or book), short window first.
 
     A dot marks a window that has no reading yet (not enough history), which
     is what the culture receives too: silence, not a weak signal.
@@ -82,6 +82,7 @@ class ConsoleView:
             ("phase", f"{s.get('phase', '-')}  ep {s.get('episode', '-')} step {s.get('step', '-')}"),
             ("market", f"{s.get('mid', float('nan')):.2f}"),
             ("momentum strip", _strip(s.get("momentum_norms"))),
+            ("book strip", _strip(s.get("imbalance_norms"))),
             ("position", f"{s.get('position', 0):+d}  unrealized {s.get('unrealized_points', 0.0):+.2f} pts"),
             ("realized", f"${s.get('realized_dollars', 0.0):+.2f}  ({s.get('n_trades', 0)} trades)"),
             ("last action", f"{s.get('action', '-')}   diff {s.get('diff', 0.0):+.3f}"),

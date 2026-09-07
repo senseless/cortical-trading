@@ -22,8 +22,8 @@ signal and the game design needs work before renting wetware. The comparison
 is against the majority class, not 0.5: on a drifting test slice, always-up
 already scores the up-share. The default probes the 'encoded' set -- exactly
 the channels the layout allocates (the momentum strip and the book-imbalance
-channel), computed by the live FeatureTracker; --sets strip removes the
-imbalance channel as a control, and extended / imbalance are diagnostics.
+strip), computed by the live FeatureTracker; --sets strip removes the
+imbalance strip as a control, and extended / imbalance are diagnostics.
 """
 
 from __future__ import annotations
@@ -37,7 +37,7 @@ from pathlib import Path
 import numpy as np
 
 from src.baseline.backtest import backtest_proba
-from src.baseline.dataset import (STALE_S, build_dataset, calibrate_imbalance_scale, calibrate_momentum_scale,
+from src.baseline.dataset import (STALE_S, build_dataset, calibrate_imbalance_scales, calibrate_momentum_scale,
                                   load_recording_series, longest_feature_window_s, synthetic_series)
 from src.baseline.models import binomial_margin, fit_logistic, fit_mlp
 from src.config import apply_override, load_config
@@ -56,7 +56,7 @@ def main() -> None:
                              "see). Others: strip (momentum ladder alone, the control for the "
                              "imbalance channel), extended, imbalance (candidate-column diagnostics)")
     parser.add_argument("--calibrate-scale", action="store_true",
-                        help="set neural.encoding.momentum_scale and imbalance_scale from the training "
+                        help="set neural.encoding.momentum_scale and imbalance_scales from the training "
                              "rows (median |input| -> |norm| 0.48, the rule the /MBT defaults follow) "
                              "so every channel is read in this product's units")
     parser.add_argument("--steps", type=int, default=50000,
@@ -122,14 +122,14 @@ def main() -> None:
                                                       args.step_interval)
         print(f"momentum_scale calibrated on training rows: {enc.momentum_scale:.4g} points/s "
               f"at {enc.momentum_scale_window_s:g}s")
-        imb_scale = calibrate_imbalance_scale(segments, enc.imbalance_window_s, args.step_interval)
-        if imb_scale is not None:
-            enc.imbalance_scale = imb_scale
+        imb_scales = calibrate_imbalance_scales(segments, enc.imbalance_windows_s, args.step_interval)
+        if imb_scales is not None:
+            enc.imbalance_scales = imb_scales
             imbalance_scale_calibrated = True
-            print(f"imbalance_scale calibrated on training rows: {enc.imbalance_scale:.4g} "
-                  f"(mean imbalance over {enc.imbalance_window_s:g}s)")
+            print("imbalance_scales calibrated on training rows: " + ", ".join(
+                f"{w:g}s {s:.3f}" for w, s in zip(enc.imbalance_windows_s, imb_scales)))
         else:
-            print("imbalance_scale left at default: the book carries no sizes in this data")
+            print("imbalance_scales left at defaults: the book carries no sizes in this data")
 
     ds = build_dataset(segments, cfg, horizons, args.step_interval, args.min_move)
     n_tr, n_va, n_te = (int(ds.splits[k].sum()) for k in ("train", "val", "test"))
@@ -174,9 +174,9 @@ def main() -> None:
         "instrument": dataclasses.asdict(cfg.instrument), "broker": dataclasses.asdict(cfg.broker),
         "momentum_scale": cfg.neural.encoding.momentum_scale,
         "momentum_scale_calibrated": bool(args.calibrate_scale),
-        "imbalance_window_s": cfg.neural.encoding.imbalance_window_s,
-        "imbalance_scale": cfg.neural.encoding.imbalance_scale,
-        "imbalance_scale_calibrated": imbalance_scale_calibrated,
+        "imbalance_windows_s": list(cfg.neural.encoding.imbalance_windows_s),
+        "imbalance_scales": [round(s, 5) for s in cfg.neural.encoding.imbalance_scales],
+        "imbalance_scales_calibrated": imbalance_scale_calibrated,
         "encoded_channels": enc_names, "encoded_silent_share": {k: round(v, 4) for k, v in dark.items()},
         "segments": len(segments), "idle_rows_skipped": idle_rows,
         "test_range_utc": [

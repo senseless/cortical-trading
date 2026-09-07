@@ -148,9 +148,11 @@ instrument: **short (-1), flat (0), long (+1)**, one contract.
   - Current position state (long/flat/short) on a dedicated electrode group —
     the neurons should "feel" their own position, like feeling the paddle.
   - Unrealized PnL direction as a third channel group.
-  - Book imbalance (bid-heavy vs ask-heavy top of book, 30 s mean) as a fourth:
-    the one non-price input, who is queued rather than what has traded. Built
-    as `imbalance_bid` / `imbalance_ask` in the layout (README "Electrode layout").
+  - Book imbalance (bid-heavy vs ask-heavy top of book) as a fourth: the one
+    non-price input, who is queued rather than what has traded. Built as a
+    second chronotopic strip pair, `imbalance_bid` / `imbalance_ask`, over a
+    1 s - 2 min ladder because that is where the book's information is
+    (README "Electrode layout" and "The book-imbalance strip").
 - **Motor output**: two motor regions, spike counts per bin:
   - Region 1 wins → move position toward +1 (buy: open long / close short).
   - Region 2 wins → move position toward -1 (sell: open short / close long).

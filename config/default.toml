@@ -82,27 +82,27 @@ sdk_seed = 42                 # CL_SDK_RANDOM_SEED for deterministic simulator r
 # corners) and 4 (measurement reference). Never assign them — the simulator
 # accepts them but on real hardware those stims are silently dead.
 #
-# The momentum groups are chronotopic strips: channel order IS the timescale
-# axis (short -> long, matching neural.encoding.momentum_windows_s), so the
-# lists below must stay ordered and exactly as long as the window ladder.
-# Row 1 carries up-momentum, row 3 down-momentum, and row 2 is left empty as
-# a guard: blending is wanted *along* a strip (adjacent timescales are
-# correlated, so cross-talk generalizes) and destructive *across* valence.
+# The momentum and imbalance groups are chronotopic strips: channel order IS
+# the timescale axis (short -> long, matching momentum_windows_s and
+# imbalance_windows_s), so the lists below must stay ordered and exactly as
+# long as their window ladders. Rows 1-2 carry the "up" valence (up-momentum,
+# bid-heavy book), rows 4-5 the "down" valence (ask-heavy book, down-momentum),
+# and row 3 is left empty as the guard between them: blending is wanted
+# *along* a strip and across same-valence strips (a rising price and a
+# bid-heavy book agree), destructive *across* valence.
 [neural.layout.sensory]
-momentum_up = [8, 9, 10, 11, 12, 13, 14, 15]      # row 1, full width: 30s -> 8h
-momentum_down = [24, 25, 26, 27, 28, 29, 30, 31]  # row 3, full width: 30s -> 8h
-position_long = [32, 33, 40, 41]   # rows 4-5 as 2x2 blocks with guard columns
-position_flat = [35, 36, 43, 44]   # (c2/c5 unassigned) so the states don't blend
-position_short = [38, 39, 46, 47]
-# Row 0 carries the two rate-coded scalar channels, one electrode each, with
-# valences mirrored around the reserved centre (c3 empty + c4 reference as the
-# guard): "good/up" (pnl_up, imbalance_bid) on the left, "bad/down" on the
-# right. Bid pressure sits next to PnL-up and ask pressure next to PnL-down,
-# so the only neighbours that bleed are of the same valence.
-pnl_up = [1]
-imbalance_bid = [2]           # bid-heavy book (buying pressure); rate = |smoothed imbalance|
-imbalance_ask = [5]           # ask-heavy book (selling pressure)
-pnl_down = [6]
+momentum_up = [8, 9, 10, 11, 12, 13, 14, 15]      # row 1: 30s -> 8h
+imbalance_bid = [16, 17, 18, 19, 20, 21, 22, 23]  # row 2: bid-heavy book, 1s -> 2min
+imbalance_ask = [32, 33, 34, 35, 36, 37, 38, 39]  # row 4: ask-heavy book, 1s -> 2min
+momentum_down = [40, 41, 42, 43, 44, 45, 46, 47]  # row 5: 30s -> 8h
+# Row 0 holds the scalar channels, one electrode each, "good/long" left of the
+# reserved centre and "bad/short" right of it: position long, PnL up, position
+# flat | reference | PnL down, position short.
+position_long = [1]
+pnl_up = [2]
+position_flat = [3]
+pnl_down = [5]
+position_short = [6]
 
 # Motor on the bottom two rows, maximally far from the strips (three rows of
 # separation); symmetric 2x3 blocks so the buy/sell differential count is
@@ -132,13 +132,16 @@ momentum_scale_window_s = 30.0  # calibration window (~1 sigma of BTC 30s drift)
                               # windows scale as 1/sqrt(window), so every strip
                               # channel spans the same 4-40 Hz range
 pnl_scale_points = 200.0      # unrealized PnL (points) that saturates the pnl signal ($20 on MBT)
-# Book-imbalance channel: (bid_size - ask_size) / (bid_size + ask_size) at the
-# top of the book, time-averaged over imbalance_window_s (the per-moment ratio
-# flips with every one-lot order; persistent pressure is the signal). Sign
-# picks imbalance_bid / imbalance_ask, tanh(mean / imbalance_scale) sets the
-# rate. Like the strip, silence until the window holds 3/4 of its span.
-imbalance_window_s = 30.0
-imbalance_scale = 0.4         # smoothed imbalance at which the channel reads ~0.76 (30 Hz); recalibrate per product
+# Book-imbalance strip: (bid_size - ask_size) / (bid_size + ask_size) at the
+# top of the book, time-averaged over each window, one electrode per window
+# short -> long. The book's information lives at seconds and is gone by five
+# minutes, so this ladder runs 1 s .. 2 min. Sign picks imbalance_bid /
+# imbalance_ask, tanh(mean / scale) sets the rate; each window has its own
+# scale because the typical |mean| shrinks with the window at a rate that
+# differs by product (no shared law). Silence until a window holds 3/4 of its
+# span. Values below are /MBT's; the gate's --calibrate-scale recomputes them.
+imbalance_windows_s = [1.0, 5.0, 10.0, 15.0, 20.0, 40.0, 60.0, 120.0]
+imbalance_scales = [0.55, 0.38, 0.34, 0.32, 0.31, 0.29, 0.27, 0.25]
 
 [neural.decoding]
 normalization = "ratio"       # ratio | zscore (vs. pre-episode baseline spontaneous activity)

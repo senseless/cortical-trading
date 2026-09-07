@@ -85,9 +85,10 @@ Requires Python 3.11+. Synthetic and replay sessions need no credentials.
    frequency 4-40 Hz = magnitude (rate coding). Momentum is delivered on two
    chronotopic strips (up and down), with timescale as a spatial axis: the
    k-th window of `momentum_windows_s` stimulates the k-th electrode along
-   the strip. Book imbalance (bid-heavy vs. ask-heavy, time-averaged over
-   `imbalance_window_s`) is place-coded by sign on its own pair of electrodes.
-   The neurons' current position is also place-coded so they can "feel" it.
+   the strip. Book imbalance (bid-heavy vs. ask-heavy) is delivered the same
+   way on a second pair of strips over its own seconds-scale ladder
+   (`imbalance_windows_s`). The neurons' current position is also
+   place-coded so they can "feel" it.
 3. Spikes are counted per motor region over the step window, normalized
    against pre-episode baseline activity, and decoded into an action:
    buy / sell / hold (open long, open short, close long, close short).
@@ -125,20 +126,21 @@ them. The default layout (`[neural.layout]` in `config/default.toml`):
 
 ```
         c0    c1    c2    c3    c4    c5    c6    c7
-  r0    xx    U+    B+     .    xx    B-    U-    xx    scalar channels: PnL, book
-  r1   M+1   M+2   M+3   M+4   M+5   M+6   M+7   M+8    up strip:   30s -> 8h
-  r2     .     .     .     .     .     .     .     .    guard row
-  r3   M-1   M-2   M-3   M-4   M-5   M-6   M-7   M-8    down strip: 30s -> 8h
-  r4    PL    PL     .    PF    PF     .    PS    PS
-  r5    PL    PL     .    PF    PF     .    PS    PS
+  r0    xx    PL    U+    PF    xx    U-    PS    xx    scalar channels: position, PnL
+  r1   M+1   M+2   M+3   M+4   M+5   M+6   M+7   M+8    up-momentum strip:   30s -> 8h
+  r2   B+1   B+2   B+3   B+4   B+5   B+6   B+7   B+8    bid-heavy book strip: 1s -> 2m
+  r3     .     .     .     .     .     .     .     .    guard row
+  r4   B-1   B-2   B-3   B-4   B-5   B-6   B-7   B-8    ask-heavy book strip: 1s -> 2m
+  r5   M-1   M-2   M-3   M-4   M-5   M-6   M-7   M-8    down-momentum strip: 30s -> 8h
   r6     .   BUY   BUY   BUY   SEL   SEL   SEL     .
   r7    xx   BUY   BUY   BUY   SEL   SEL   SEL   xx
 ```
 
 `xx` reserved &nbsp;|&nbsp; `.` unassigned (still recorded) &nbsp;|&nbsp;
 sensory: `M+k`/`M-k` momentum up/down at the k-th timescale (`momentum_windows_s`
-= 30 s, 1 m, 5 m, 15 m, 30 m, 1 h, 4 h, 8 h), `B+/B-` book imbalance
-bid-heavy/ask-heavy (`imbalance_window_s` = 30 s mean), `PL/PF/PS` position
+= 30 s, 1 m, 5 m, 15 m, 30 m, 1 h, 4 h, 8 h), `B+k`/`B-k` book imbalance
+bid-heavy/ask-heavy averaged over the k-th window (`imbalance_windows_s` =
+1 s, 5 s, 10 s, 15 s, 20 s, 40 s, 1 m, 2 m), `PL/PF/PS` position
 long/flat/short, `U+/U-` unrealized PnL up/down &nbsp;|&nbsp; motor:
 `BUY`/`SEL` decode regions
 
@@ -167,41 +169,56 @@ Why this shape:
   they are; since momentum at neighboring timescales is strongly correlated,
   putting those signals on neighboring sites turns electrode cross-talk into
   generalization rather than interference. Blending is *wanted* along the
-  timescale axis and *destructive* across valence — hence two parallel strips
-  with a guard row (r2) between them.
+  timescale axis and *destructive* across valence — hence the strips are
+  grouped by valence, "up" (up-momentum, bid-heavy book) on r1-r2 and
+  "down" (ask-heavy book, down-momentum) on r4-r5, with a guard row (r3)
+  between the two blocks. Within a block the neighbours agree in sign: a
+  rising price and a bid-heavy book are the same story told by two inputs,
+  so cross-talk between them reinforces rather than cancels.
+- **The book gets its own ladder because its information lives at a
+  different timescale.** Measured on a week of eleven micro futures, the
+  sign of the 5 s mean imbalance calls the next 60 s move right 52.3% of the
+  time and the 1 s ratio 51.7%; by the 5 min mean it is 50.3%, noise. Price
+  momentum is the opposite (its information is at minutes to hours), so the
+  two strips cover 1 s - 2 min and 30 s - 8 h respectively, and each book
+  window gets its own calibrated scale because the typical |mean| shrinks
+  with the window at a product-dependent rate (no shared law like the
+  momentum strip's 1/sqrt(w)).
 - **Multi-timeframe structure becomes spatial.** Windows can disagree in
   sign, and that is the point: a short-term pullback inside a long-term
   uptrend lights the down strip's short end and the up strip's long end at
   the same time — a pattern no single-window encoding can represent.
 - **Opposite valences separated.** Stimulation activates tissue beyond the
   target electrode (~100 um), so groups whose meanings are opposites
-  (`M+`/`M-` on separate rows, `U+`/`U-` and `B+`/`B-` mirrored around the
-  reserved centre of r0, `PL`/`PS` at opposite ends of their rows with guard
-  columns c2/c5) get physical separation — blending them would destroy the
-  signal they carry. The cost of a 64-electrode budget is that r0's scalar
-  groups sit directly above the up strip; cross-*signal* bleed is tolerated
-  where cross-*valence* bleed is not.
+  (`M+`/`B+` vs `B-`/`M-` on separate row blocks, `PL`/`U+` vs `U-`/`PS`
+  mirrored around the reserved centre of r0) get physical separation —
+  blending them would destroy the signal they carry. The cost of a
+  64-electrode budget is that r0's scalar groups sit directly above the up
+  strip; cross-*signal* bleed is tolerated where cross-*valence* bleed is
+  not.
 - **Scalar channels share r0, one electrode each, sorted by valence.** Row 0
-  holds the two rate-coded scalar signals — unrealized PnL and book
-  imbalance — with the "good" side (`U+`, `B+`) left of the reserved c4 and
-  the "bad" side (`B-`, `U-`) right of it, c3 left empty as a second guard.
-  A bid-heavy book therefore stimulates next to PnL-up and an ask-heavy book
-  next to PnL-down: the only neighbours that bleed agree in sign. Single
-  electrodes suffice for stimulation groups (DishBrain place-coded eight ball
-  positions on eight single electrodes); the alternative, spending the
-  position rows' guard columns, would have put a 40 Hz group one row above
-  the motor regions, which the next principle forbids.
+  holds the five rate- or state-coded scalars — position long/flat/short and
+  unrealized PnL up/down — with the "good/long" side (`PL`, `U+`) left of
+  the reserved c4, `PF` beside it as the neutral state, and the
+  "bad/short" side (`U-`, `PS`) right of it. Single electrodes suffice for
+  stimulation groups (DishBrain place-coded eight ball positions on eight
+  single electrodes); four full rows go to the strips because the strips
+  are where the market information is.
 - **Sensory top, motor bottom.** Maximizing distance between stimulation
   sites and decode regions keeps directly evoked activity from dominating
   the spike counts the decoder reads; the decision should ride on network
-  dynamics, not on stim artifacts. Motor lives on the bottom two rows, three
-  rows below the nearest high-rate strip; the mildest sensory group
-  (position, a fixed 8 Hz) is the one placed nearest.
+  dynamics, not on stim artifacts. Motor lives on the bottom two rows. With
+  four strips on the grid the nearest one (down-momentum, r5) is directly
+  above the motor rows — the price of the second ladder. The decoder reads
+  each region's counts against its own pre-episode baseline and the
+  differential between the two regions, so a symmetric artifact cancels; an
+  asymmetric one (the strip's short end sits over `BUY`, its long end over
+  `SEL`) is the thing to watch in the spike record when the culture goes in.
 - **Contiguous, symmetric motor blocks.** Buy and sell are mirror-image 2x3
   regions (echoing DishBrain's two paddle regions); decoding compares
   region-level spike counts, so equal size and geometry keep the buy/sell
   differential unbiased, and region sums are robust to single-electrode
-  noise. Position states are 2x2 blocks for the same redundancy.
+  noise.
 
 ### Why the ladder runs 30 s to 8 h
 
@@ -255,23 +272,33 @@ quasi-static for tens of minutes at a time, and cultures habituate to
 unvarying stimulation, so the 4-8 h channels act as slow context bias rather
 than dynamic drive.
 
-### The book-imbalance channel
+### The book-imbalance strip
 
 Top-of-book imbalance, `(bid_size - ask_size) / (bid_size + ask_size)`, is
 the one non-price input: who is queued to trade, rather than what has traded.
-On a micro book the top level is a handful of contracts and the per-moment
-ratio flips with every one-lot order, so the channel carries its
-`imbalance_window_s` (30 s) time average — persistent one-sided pressure,
-the version with predictive evidence behind it in the order-flow literature.
-Sign picks the electrode (`B+` bid-heavy, `B-` ask-heavy), and
-`tanh(mean / imbalance_scale)` sets the rate, with `imbalance_scale`
-calibrated like the strip's (median |input| reads |norm| 0.48; the default
-0.4 is /MBT's, `--calibrate-scale` recomputes it per product). The same
-silence rule applies: the channel is dark until its window holds three
-quarters of its span, so a post-gap value built from a couple of quotes never
-fires a saturated burst. Candle history has no sizes, so the pre-roll cannot
-seed it — but it only needs 30 s, and the pre-session rest feeds the tracker,
-so it is live from the first step.
+It is delivered as a second chronotopic strip pair, the same construction as
+momentum's: the k-th window of `imbalance_windows_s` (1 s, 5 s, 10 s, 15 s,
+20 s, 40 s, 1 m, 2 m) stimulates the k-th electrode, sign picks the strip
+(`B+` bid-heavy, `B-` ask-heavy), and `tanh(mean / imbalance_scales[k])`
+sets the rate. Each window is the time average of the ratio over that many
+seconds, so the short end is the present book (which flips with every
+one-lot order on a micro book) and the long end is persistent one-sided
+pressure; as with momentum, the windows can disagree and the disagreement is
+information (a two-minute ask-heavy book with the bid stacking up in the last
+five seconds). The ladder is short because the signal is: on a week of
+eleven micro futures the 5 s mean called the next 60 s direction 52.3% of the
+time, the 1 s ratio 51.7%, the 2 min mean 50.7%, and the 5 min mean 50.3% —
+and the edge is spent within that first minute (the 5 s sign carries nothing
+about minutes 2-15). `imbalance_scales` holds one scale per window (the
+median |mean| reads |norm| 0.48; the defaults are /MBT's,
+`--calibrate-scale` recomputes them per product) because the typical |mean|
+shrinks with the window at a product-dependent rate. The same silence rule
+applies: a window is dark until it holds three quarters of its span, so a
+post-gap value built from a couple of quotes never fires a saturated burst;
+the 1 s window, which holds only the current quote, is live as soon as the
+sampling cadence is known. Candle history has no sizes, so the pre-roll
+cannot seed the strip — but its longest window is two minutes, and the
+pre-session rest feeds the tracker, so it is live from the first step.
 
 ## Contract rolls
 
@@ -331,14 +358,14 @@ rental time. Label horizons default to holding-period scale (1 m - 1 h),
 matching where /MBT moves clear costs. It reports directional accuracy per
 horizon against the majority-class benchmark (with overlap-adjusted
 confidence intervals) for the current neural encoding — the `encoded` set:
-every sensory market channel the layout allocates, i.e. the chronotopic strip
-(one column per window) and the book-imbalance channel, computed by the same
-`FeatureTracker` the live encoder uses, so the gate probes exactly what the
-neurons see and follows the layout automatically — and backtests the
-resulting policies through the real game engine and paper broker against
-time-shifted luck baselines. `--sets` adds diagnostics: `strip` (the
-momentum ladder without the imbalance channel, the control for what the
-channel adds), `extended` (candidate columns: returns over windows from 1 s
+every sensory market channel the layout allocates, i.e. the momentum strip
+and the book-imbalance strip (one column per window of each ladder, 16 in
+the default layout), computed by the same `FeatureTracker` the live encoder
+uses, so the gate probes exactly what the neurons see and follows the layout
+automatically — and backtests the resulting policies through the real game
+engine and paper broker against time-shifted luck baselines. `--sets` adds
+diagnostics: `strip` (the momentum ladder without the imbalance strip, the
+control for what the book adds), `extended` (candidate columns: returns over windows from 1 s
 to 8 h, vol-normalized variants, volatility regime, spread, range position,
 time of day) and `imbalance` (the raw book alone, instantaneous and smoothed
 over several windows). Extended return columns use the same per-window
@@ -375,7 +402,8 @@ instrument.point_value=5 --set instrument.tick_size=0.25` for `/MES`), and
 `--calibrate-scale` sets `momentum_scale` from the training rows by the rule
 the `/MBT` default follows (median |velocity| over the 30 s window lands at
 |norm| 0.48), so the strip is read in that product's units instead of bitcoin
-points, and `imbalance_scale` by the same rule on the smoothed imbalance.
+points, and each of the `imbalance_scales` by the same rule on that window's
+mean imbalance.
 Without it a slow product reads all-zero and a fast one saturates. The
 calibrated values, the encoded column names and each channel's silent share
 are written to `report.json`. In every report, "best@300s" names the

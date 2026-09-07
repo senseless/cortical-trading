@@ -45,6 +45,10 @@ class FeatureTracker:
     Window anchors advance monotonically (one cursor per window) instead of
     rescanning history, because the ladder retains hours of quotes and the
     baseline dataset builder calls update() once per row of a recording.
+
+    The book-imbalance strip is the same construction on a different
+    quantity: the time average of the top-of-book imbalance over each window
+    of its own (seconds-scale) ladder, with the same silence rule.
     """
 
     VOL_WINDOW_S = 60.0     # volatility is a step-scale statistic, not part of the ladder
@@ -60,20 +64,42 @@ class FeatureTracker:
         self.cfg = cfg
         self.windows: list[float] = list(cfg.momentum_windows_s)
         self.scales: list[float] = cfg.momentum_scales
+        self.imb_windows: list[float] = list(cfg.imbalance_windows_s)
+        self.imb_scales: list[float] = list(cfg.imbalance_scales)
         self._t: list[float] = []
         self._mid: list[float] = []
+        self._imb: list[float] = []                 # top-of-book imbalance per sample
         self._head = 0                              # oldest live sample
         self._cursor = [0] * len(self.windows)      # per-window anchor
+        # Imbalance strip: each window keeps the index of its oldest sample
+        # and a running sum of the samples from there to the present, so the
+        # window mean is O(1) per step (the dataset builder calls update()
+        # once per second of a week-long recording).
+        self._imb_cursor = [0] * len(self.imb_windows)
+        self._imb_sum = [0.0] * len(self.imb_windows)
         self._vol: deque[tuple[float, float]] = deque()
-        self._imb: deque[tuple[float, float]] = deque()   # (t, top-of-book imbalance)
 
     def reset(self) -> None:
         self._t.clear()
         self._mid.clear()
+        self._imb.clear()
         self._head = 0
         self._cursor = [0] * len(self.windows)
+        self._imb_cursor = [0] * len(self.imb_windows)
+        self._imb_sum = [0.0] * len(self.imb_windows)
         self._vol.clear()
-        self._imb.clear()
+
+    def _compact(self) -> None:
+        """Drop consumed history; every index into the sample lists shifts."""
+        del self._t[:self._head]
+        del self._mid[:self._head]
+        del self._imb[:self._head]
+        self._cursor = [max(0, c - self._head) for c in self._cursor]
+        self._imb_cursor = [max(0, c - self._head) for c in self._imb_cursor]
+        self._head = 0
+        # Re-sum the imbalance windows exactly; the running sums drift by a
+        # rounding error per step and this is the natural place to reset it.
+        self._imb_sum = [sum(self._imb[c:]) for c in self._imb_cursor]
 
     def seed(self, snaps: list[MarketSnapshot]) -> None:
         """Prepend pre-roll history so the long windows speak immediately.
@@ -86,36 +112,43 @@ class FeatureTracker:
         pre-roll history is far coarser than the step grid.
         """
         if self._head:
-            del self._t[:self._head]
-            del self._mid[:self._head]
             # Cursors index the lists; keep them valid even if nothing is
             # prepended below (an early return with stale indices would make
             # the next update() read past the end).
-            self._cursor = [max(0, c - self._head) for c in self._cursor]
-            self._head = 0
+            self._compact()
         cut = self._t[0] if self._t else math.inf
         hist = sorted((s.t, s.mid) for s in snaps if s.t < cut)
         if not hist:
             return
         self._t[:0] = [t for t, _ in hist]
         self._mid[:0] = [m for _, m in hist]
+        # Candle history carries no book sizes: the prepended samples read a
+        # balanced book (0), and since they are older than every imbalance
+        # window they fall out of the sums on the next update anyway.
+        self._imb[:0] = [0.0] * len(hist)
         self._cursor = [0] * len(self.windows)
+        self._imb_cursor = [0] * len(self.imb_windows)
+        self._imb_sum = [sum(self._imb)] * len(self.imb_windows)
 
     def update(self, snap: MarketSnapshot) -> dict[str, float | list[float]]:
+        # Sources without sizes (candle pre-roll, synthetic) read a balanced
+        # book: exactly zero, which the encoder renders as silence.
+        size_sum = snap.bid_size + snap.ask_size
+        imb_now = (snap.bid_size - snap.ask_size) / size_sum if size_sum > 0 else 0.0
         self._t.append(snap.t)
         self._mid.append(snap.mid)
+        self._imb.append(imb_now)
+        for k in range(len(self._imb_sum)):
+            self._imb_sum[k] += imb_now     # before any compaction re-sums the lists
         now, mid = snap.t, snap.mid
 
         # Retain a little more than the longest window so its anchor exists.
-        retain = self.windows[-1] + 60.0
+        retain = max(self.windows[-1], self.imb_windows[-1]) + 60.0
         n = len(self._t)
         while self._head < n - 1 and now - self._t[self._head] > retain:
             self._head += 1
         if self._head >= self._COMPACT_AT:
-            del self._t[:self._head]
-            del self._mid[:self._head]
-            self._cursor = [max(0, c - self._head) for c in self._cursor]
-            self._head = 0
+            self._compact()
             n = len(self._t)
 
         history_s = now - self._t[self._head]
@@ -143,23 +176,33 @@ class FeatureTracker:
         diffs = [b[1] - a[1] for a, b in zip(pts[:-1], pts[1:]) if b[0] - a[0] <= 5.0]
         vol = statistics.pstdev(diffs) if len(diffs) >= 2 else 0.0
 
-        # Book imbalance channel: the time average of the top-of-book ratio
-        # over imbalance_window_s. Same silence rule as the strip -- the window
-        # must hold three quarters of its span before the channel speaks, so a
+        # Book imbalance strip: the time average of the top-of-book ratio over
+        # each window of its ladder. Same silence rule as the momentum strip --
+        # a window speaks once it holds three quarters of its span, so a
         # post-gap or fresh-start value (one or two one-lot quotes) is not
-        # rendered as a saturated burst in a random direction. Sources without
-        # sizes (candle pre-roll, synthetic) read exactly zero: silence.
-        size_sum = snap.bid_size + snap.ask_size
-        imb_now = (snap.bid_size - snap.ask_size) / size_sum if size_sum > 0 else 0.0
-        self._imb.append((now, imb_now))
-        imb_window = self.cfg.imbalance_window_s
-        while self._imb and now - self._imb[0][0] > imb_window:
-            self._imb.popleft()
-        imb_span = now - self._imb[0][0]
-        imb_mean = 0.0
-        if imb_span >= self.MIN_SPAN_FRAC * imb_window:
-            imb_mean = sum(v for _, v in self._imb) / len(self._imb)
-        imb_norm = math.tanh(imb_mean / self.cfg.imbalance_scale) if self.cfg.imbalance_scale else 0.0
+        # rendered as a saturated burst in a random direction. A window holds
+        # the samples younger than its length (w samples at 1 Hz, the same
+        # definition the gate's calibration uses), so a window no longer than
+        # the sampling interval (the 1 s window at 1 Hz) holds exactly the
+        # current sample and is live at once: its mean *is* the present book,
+        # which is the right reading, not a post-gap artifact.
+        dt_last = now - self._t[n - 2] if n >= 2 else 0.0  # unknown cadence on the very first sample: silence
+        imb_means: list[float] = []
+        imb_norms: list[float] = []
+        for k, window in enumerate(self.imb_windows):
+            c = self._imb_cursor[k]
+            while c < n - 1 and now - self._t[c] >= window:
+                self._imb_sum[k] -= self._imb[c]
+                c += 1
+            self._imb_cursor[k] = c
+            count = n - c
+            span = now - self._t[c]
+            mean = 0.0
+            if span >= self.MIN_SPAN_FRAC * window or (count == 1 and window <= dt_last):
+                mean = self._imb_sum[k] / count
+            imb_means.append(mean)
+            scale = self.imb_scales[k]
+            imb_norms.append(math.tanh(mean / scale) if scale else 0.0)
 
         return {
             "mid": mid,
@@ -168,8 +211,8 @@ class FeatureTracker:
             "momentum_norms": norms,
             "vol_points": vol,
             "imbalance": imb_now,
-            "imbalance_mean": imb_mean,
-            "imbalance_norm": imb_norm,
+            "imbalance_means": imb_means,
+            "imbalance_norms": imb_norms,
         }
 
 

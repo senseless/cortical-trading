@@ -12,7 +12,9 @@ configured window is stimulated on the k-th channel of the strip, so timescale
 is a spatial axis ordered short -> long. Different windows can disagree in
 sign, and that is the point -- a short-term pullback inside a longer uptrend
 lights the down strip's short end and the up strip's long end at the same
-time, a pattern a single-window encoding cannot represent.
+time, a pattern a single-window encoding cannot represent. Book imbalance is
+delivered the same way on its own pair of strips (bid-heavy / ask-heavy) over
+a seconds-scale ladder.
 """
 
 from __future__ import annotations
@@ -93,14 +95,21 @@ class Encoder:
             add([channels[k]], self._rate(v),
                 f"momentum{'+' if v > 0 else '-'}[{self.cfg.momentum_windows_s[k]:g}s]")
 
-        # 1b. Book imbalance: sign -> bid-heavy or ask-heavy group (place),
+        # 1b. Book imbalance strip, same construction: sign -> bid-heavy or
+        # ask-heavy strip (place), window index -> electrode along it (place),
         # magnitude of the time-averaged imbalance -> rate. Zero (balanced
         # book, no sizes, or a window still filling after a gap) is silence.
-        imb = features.get("imbalance_norm", 0.0)
-        if imb != 0.0:
-            imb_group = "imbalance_bid" if imb > 0 else "imbalance_ask"
-            if lay.has(imb_group):
-                add(lay.group(imb_group), self._rate(imb), f"imbalance{'+' if imb > 0 else '-'}")
+        for k, v in enumerate(features.get("imbalance_norms", ())):
+            if v == 0.0:
+                continue
+            group = "imbalance_bid" if v > 0 else "imbalance_ask"
+            if not lay.has(group):
+                continue
+            channels = lay.group(group)
+            if k >= len(channels):
+                continue
+            add([channels[k]], self._rate(v),
+                f"imbalance{'+' if v > 0 else '-'}[{self.cfg.imbalance_windows_s[k]:g}s]")
 
         # 2. Position state: pure place coding at a fixed rate (the neurons feel their paddle).
         pos_group = {1: "position_long", 0: "position_flat", -1: "position_short"}[int(position)]

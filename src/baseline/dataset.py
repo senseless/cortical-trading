@@ -5,14 +5,15 @@ Sources (recordings or synthetic regimes) are resampled onto a fixed step grid
 
 - "encoded": exactly the market signal the neurons receive -- the
   tanh-normalized momentum strip from FeatureTracker (one column per
-  chronotopic window) plus the book-imbalance channel (time-averaged
-  top-of-book imbalance, tanh-scaled) when the layout allocates its
-  electrodes, computed with the same code and config as the live encoder.
+  chronotopic window) plus the book-imbalance strip (time-averaged
+  top-of-book imbalance over its own seconds-scale ladder, one column per
+  window, tanh-scaled) when the layout allocates its electrodes, computed
+  with the same code and config as the live encoder.
   Windows longer than the history available so far read zero, exactly as the
   live encoder renders them (silence), so short recordings still build a
   dataset with a partly dark strip rather than being rejected outright.
 - "strip": the momentum ladder alone -- the control for what the imbalance
-  channel adds. Note the asymmetry with a live
+  strip adds. Note the asymmetry with a live
   session, which pre-rolls the strip from history before the first step: in a
   recording-built dataset the long windows are dark for the first hours of
   every segment (a segment is a gap-free stretch of the whole library, not a
@@ -221,37 +222,42 @@ def calibrate_momentum_scale(segments: list[Segment], window_s: float, step_s: f
     return median_v / math.atanh(target_norm)
 
 
-def calibrate_imbalance_scale(segments: list[Segment], window_s: float, step_s: float = 1.0,
-                              frac: float = 0.6, target_norm: float = 0.48) -> float | None:
-    """Imbalance scale that puts the median |smoothed imbalance| at target_norm.
+def calibrate_imbalance_scales(segments: list[Segment], windows_s: list[float], step_s: float = 1.0,
+                               frac: float = 0.6, target_norm: float = 0.48) -> list[float] | None:
+    """Per-window imbalance scales that put each window's median |mean| at target_norm.
 
-    The same rule as the momentum scale, applied to the imbalance channel's
+    The same rule as the momentum scale, applied to each imbalance window's
     input (the window mean of the top-of-book ratio) on the training rows.
+    There is one scale per window rather than a shared law because the rate
+    at which the typical |mean| shrinks with the window differs by product.
     Returns None when the book carries no sizes (synthetic data, candle
-    history), in which case the configured default stands and the channel is
+    history), in which case the configured defaults stand and the strip is
     silent anyway.
     """
-    w = max(1, int(round(window_s / step_s)))
     total = sum(len(s) for s in segments)
-    budget = int(total * frac)
-    vals = []
-    for seg in segments:
-        take = min(len(seg), budget)
-        if take > w:
-            size_sum = seg.bid_size[:take] + seg.ask_size[:take]
-            with np.errstate(invalid="ignore", divide="ignore"):
-                imb = np.where(size_sum > 0, (seg.bid_size[:take] - seg.ask_size[:take]) / size_sum, 0.0)
-            smooth = _rolling_mean(imb, w)[w:]
-            vals.append(np.abs(smooth[seg.fresh_mask()[w:take]]))
-        budget -= take
-        if budget <= 0:
-            break
-    if not vals:
-        return None
-    median = float(np.median(np.concatenate(vals)))
-    if median <= 0:
-        return None
-    return median / math.atanh(target_norm)
+    scales: list[float] = []
+    for window_s in windows_s:
+        w = max(1, int(round(window_s / step_s)))
+        budget = int(total * frac)
+        vals = []
+        for seg in segments:
+            take = min(len(seg), budget)
+            if take > w:
+                size_sum = seg.bid_size[:take] + seg.ask_size[:take]
+                with np.errstate(invalid="ignore", divide="ignore"):
+                    imb = np.where(size_sum > 0, (seg.bid_size[:take] - seg.ask_size[:take]) / size_sum, 0.0)
+                smooth = _rolling_mean(imb, w)[w:]
+                vals.append(np.abs(smooth[seg.fresh_mask()[w:take]]))
+            budget -= take
+            if budget <= 0:
+                break
+        if not vals:
+            return None
+        median = float(np.median(np.concatenate(vals)))
+        if median <= 0:
+            return None
+        scales.append(median / math.atanh(target_norm))
+    return scales
 
 
 def _segment_from_rows(rows: list[tuple[float, float, float, float, float]],
@@ -370,7 +376,8 @@ def build_dataset(
     strip_names = [f"mom_{w:g}s" for w in enc_cfg.momentum_windows_s]
     n_strip = len(strip_names)
     imbalance_channel = "imbalance_bid" in cfg.neural.sensory and "imbalance_ask" in cfg.neural.sensory
-    encoded_names = strip_names + ([f"imb_norm_{enc_cfg.imbalance_window_s:g}s"] if imbalance_channel else [])
+    imb_names = [f"imb_{w:g}s" for w in enc_cfg.imbalance_windows_s] if imbalance_channel else []
+    encoded_names = strip_names + imb_names
 
     xs_enc, xs_ext, xs_imb, meta_rows, seg_ids = [], [], [], [], []
     labels: dict[float, list[np.ndarray]] = {h: [] for h in horizons_s}
@@ -402,7 +409,7 @@ def build_dataset(
             feats = tracker.update(snap)
             momentum[i, :n_strip] = feats["momentum_norms"]
             if imbalance_channel:
-                momentum[i, n_strip] = feats["imbalance_norm"]
+                momentum[i, n_strip:] = feats["imbalance_norms"]
 
         # Extended features, built by name so columns stay aligned with EXTENDED_NAMES.
         eps = 1e-9

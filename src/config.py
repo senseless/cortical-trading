@@ -127,13 +127,23 @@ class EncodingCfg:
     momentum_scale: float = 1.2
     momentum_scale_window_s: float = 30.0
     pnl_scale_points: float = 200.0
-    # Book-imbalance channel (layout groups imbalance_bid / imbalance_ask):
-    # top-of-book (bid_size - ask_size) / (bid_size + ask_size), time-averaged
-    # over imbalance_window_s -- the per-moment ratio flips with every one-lot
-    # order on a thin micro book; persistent one-sided pressure is the signal.
-    # Sign -> which group (place), tanh(mean / imbalance_scale) -> rate.
-    imbalance_window_s: float = 30.0
-    imbalance_scale: float = 0.4
+    # Chronotopic book-imbalance strip (layout groups imbalance_bid /
+    # imbalance_ask, one electrode per window, ordered short -> long): the
+    # top-of-book ratio (bid_size - ask_size) / (bid_size + ask_size)
+    # time-averaged over each window. The book's information lives at seconds
+    # (measured: 52.3% direction accuracy at 60 s from the 5 s mean, decaying
+    # to 50.3% by the 5 min mean), so unlike the momentum ladder this one runs
+    # 1 s .. 2 min. Sign -> which strip (place), tanh(mean / scale_k) -> rate.
+    imbalance_windows_s: list[float] = field(
+        default_factory=lambda: [1.0, 5.0, 10.0, 15.0, 20.0, 40.0, 60.0, 120.0])
+    # One scale per window: the mean imbalance at which that channel reads
+    # |norm| 0.76 (~30 Hz). The typical |mean| shrinks with the window, but
+    # the exponent differs by product (0.13 on /MBT, 0.42 on /MNQ), so there
+    # is no shared law like the strip's 1/sqrt(w); each window is calibrated
+    # (median |mean| -> |norm| 0.48). Defaults are the /MBT values; the gate's
+    # --calibrate-scale recomputes them per product.
+    imbalance_scales: list[float] = field(
+        default_factory=lambda: [0.55, 0.38, 0.34, 0.32, 0.31, 0.29, 0.27, 0.25])
 
     def scale_for_window(self, window_s: float) -> float:
         """Points-per-second that saturates the signal for a given window.
@@ -243,16 +253,29 @@ class Config:
                 "ascending: the order along the strip *is* the timescale axis")
         if self.neural.encoding.momentum_scale_window_s <= 0:
             raise ValueError("neural.encoding.momentum_scale_window_s must be > 0")
-        if self.neural.encoding.imbalance_window_s <= 0:
-            raise ValueError("neural.encoding.imbalance_window_s must be > 0")
-        if self.neural.encoding.imbalance_scale <= 0:
-            raise ValueError("neural.encoding.imbalance_scale must be > 0")
-        # The imbalance channel is place-coded by sign, so it needs both groups
-        # or neither; with only one, half the signal would be silently dropped.
+        # The imbalance strip follows the same rules: an ascending ladder, one
+        # scale per window, and both valence strips or neither (place-coded by
+        # sign, so a single strip would silently drop half the signal).
+        enc = self.neural.encoding
+        iw = enc.imbalance_windows_s
+        if not iw or any(w <= 0 for w in iw):
+            raise ValueError("neural.encoding.imbalance_windows_s must list positive windows")
+        if list(iw) != sorted(iw) or len(set(iw)) != len(iw):
+            raise ValueError(f"neural.encoding.imbalance_windows_s = {iw} must be strictly ascending")
+        if len(enc.imbalance_scales) != len(iw) or any(s <= 0 for s in enc.imbalance_scales):
+            raise ValueError("neural.encoding.imbalance_scales needs one positive scale per window in "
+                             f"imbalance_windows_s ({len(iw)} windows, {len(enc.imbalance_scales)} scales)")
         imb_groups = [g for g in ("imbalance_bid", "imbalance_ask") if g in self.neural.sensory]
         if len(imb_groups) == 1:
             raise ValueError("neural.layout.sensory needs both imbalance_bid and imbalance_ask "
                              f"(or neither); found only {imb_groups[0]}")
+        for group in imb_groups:
+            chans = self.neural.sensory[group]
+            if len(chans) != len(iw):
+                raise ValueError(
+                    f"neural.layout.sensory.{group} has {len(chans)} channels but "
+                    f"imbalance_windows_s has {len(iw)} windows; the strip needs exactly one "
+                    "electrode per window, ordered short -> long")
         for group in ("momentum_up", "momentum_down"):
             chans = self.neural.sensory.get(group)
             if chans is not None and len(chans) != len(windows):

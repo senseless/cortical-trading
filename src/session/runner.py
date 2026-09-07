@@ -477,7 +477,7 @@ class SessionRunner:
             t=round(t_game, 3), wall_t=time.time(), episode=episode, step=step,
             mid=snap.mid, bid=snap.bid, ask=snap.ask,
             momentum_norms=[round(v, 4) for v in feats["momentum_norms"]],
-            imbalance_norm=round(feats.get("imbalance_norm", 0.0), 4),
+            imbalance_norms=[round(v, 4) for v in feats["imbalance_norms"]],
             vol_points=round(feats["vol_points"], 4),
             action=action.value, executed=result.executed, position=result.position,
             mtm_points=round(result.mtm_points, 4),
@@ -497,7 +497,8 @@ class SessionRunner:
 
         view.update(self._view_state(
             phase="episode", episode=episode, step=step, mid=snap.mid,
-            momentum_norms=feats["momentum_norms"], action=action.value,
+            momentum_norms=feats["momentum_norms"], imbalance_norms=feats["imbalance_norms"],
+            action=action.value,
             diff=debug.get("diff", 0.0) if isinstance(debug, dict) else 0.0,
             buy_count=debug.get("raw", {}).get("buy", 0) if isinstance(debug, dict) else 0,
             sell_count=debug.get("raw", {}).get("sell", 0) if isinstance(debug, dict) else 0,
